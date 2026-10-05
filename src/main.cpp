@@ -329,6 +329,12 @@ static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static bool        g_playerFlying     = true;    // false = walk / jump / gravity
 static bool        g_playerCollision  = true;    // reserved: the capsule is
         // the movement system, so this only gates future per-object contact
+static bool        g_playerNoclip     = false;   // pass through everything (V)
+
+// Noclip always flies: there is nothing to stand on.
+static bool playerFlies() {
+    return g_playerFlying || g_playerNoclip;
+}
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
 static GLScene::SPlayerCfg g_playerCfg;          // the player character
 static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
@@ -2730,7 +2736,7 @@ static void applyCameraMovement(float dt) {
 
     // Walking mode: Shift does nothing (gravity owns vertical), Space is a
     // jump impulse queued in the key handler.
-    if (!g_playerFlying)
+    if (!playerFlies())
         VERTICAL = 0.f;
 
     // Diagonals must not be faster than a straight run: W+D used to add the
@@ -2746,7 +2752,7 @@ static void applyCameraMovement(float dt) {
     const bool  MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
     const float tau    = g_cfgMoveInertia;
 
-    if (!g_playerFlying) {
+    if (!playerFlies()) {
         // --- walking: the keys own the horizontal plane; Jolt's gravity
         // (system -14, the old player constant) owns the vertical one ---
         const float SPEED = CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f);
@@ -3032,6 +3038,14 @@ static void update3D(float dt) {
                     JPH::Quat::sIdentity(), JPH::EActivation::Activate);
         }
 
+        // Noclip: the body sits on the layer that collides with nothing
+        // (the one carried objects use), so walls, floors and the grid
+        // slab let it through; the camera still rides it.
+        const JPH::ObjectLayer WANT_LAYER =
+            g_playerNoclip ? LAYER_GRABBED : LAYER_MOVING;
+        if (g_bodyIf->GetObjectLayer(g_playerBody) != WANT_LAYER)
+            g_bodyIf->SetObjectLayer(g_playerBody, WANT_LAYER);
+
         applyCameraMovement(dt); // -> s_moveVel
 
         // The character's facing: RY(pi - yaw) maps the authored +Z front
@@ -3101,7 +3115,7 @@ static void update3D(float dt) {
 
         // Flying: all three axes key-driven, gravity asleep. Walking: the
         // keys own the horizontal plane, Jolt's gravity the vertical one.
-        if (g_playerFlying) {
+        if (playerFlies()) {
             g_bodyIf->SetGravityFactor(g_playerBody, 0.0f);
             g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(
                 s_moveVel.x, s_moveVel.y, s_moveVel.z));
@@ -3130,7 +3144,7 @@ static void update3D(float dt) {
         // jumps, stops and the walk<->fly switch never pop.
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
-        const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
+        const bool BOBING = g_cfgWalkBob && !playerFlies() && g_grounded &&
             g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
         const float TARGET_AMP =
             BOBING ? kBobAmplitude *
@@ -3659,7 +3673,7 @@ static void dumpStatus() {
             << PP.GetZ() << ") vel=(" << PV.GetX() << "," << PV.GetY()
             << "," << PV.GetZ() << ") moveVel=(" << s_moveVel.x << ","
             << s_moveVel.y << "," << s_moveVel.z << ") grounded="
-            << g_grounded << " flying=" << g_playerFlying << "\n";
+            << g_grounded << " flying=" << g_playerFlying << " noclip=" << g_playerNoclip << "\n";
     }
 }
 
@@ -4319,7 +4333,7 @@ static void onKeyboardKey(
     // focused window -- a jump here would fire on every typed space.
     if (PRESSED && SYM == XKB_KEY_space &&
         g_keyboardMode == EKeyboardMode::Space &&
-        !g_playerFlying && g_grounded)
+        !playerFlies() && g_grounded)
         g_playerJumpQueued = true; // applied to the body in update3D
 
     // F3 toggles the debug HUD (collision wireframe + info overlay) in both
@@ -4358,6 +4372,18 @@ static void onKeyboardKey(
     // Window mode: every key reaches the focused window untouched.
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
+
+    // V toggles noclip: walk through walls and doors.
+    if (SYM == XKB_KEY_v) {
+        if (PRESSED) {
+            g_playerNoclip = !g_playerNoclip;
+            notify(g_playerNoclip ? "[hypr3d] noclip on" : "[hypr3d] noclip off",
+                   CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+        }
+
+        info.cancelled = true;
+        return;
+    }
 
     // F5: cycle the view -- first person, third person behind, third
     // person in front.
@@ -4602,6 +4628,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.move_speed must be a number");
         if (!SET_BOOL(idx, "flying", g_playerFlying, "player.flying"))
             return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
+        if (!SET_BOOL(idx, "noclip", g_playerNoclip, "player.noclip"))
+            return luaL_error(L, "hypr3d.config: player.noclip must be a boolean");
         if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
         if (!SET_BOOL(idx, "collision", g_playerCollision, "player.collision"))
