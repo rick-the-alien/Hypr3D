@@ -275,10 +275,12 @@ static void pollFullscreen();
 static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox = true);
 
 // Windows that appear while the view is open spawn as floating panels of
-// this logical size (see ghostWindows), and enter the room this far in front
-// of the camera, facing it.
-static constexpr float kSpawnWidth    = 960.0f;
-static constexpr float kSpawnHeight   = 540.0f;
+// this logical size, windows.spawn_width/height (see ghostWindows), and enter
+// the room in front of the camera, facing it. A larger box with a smaller
+// window_scale gives the same panel in the room with more pixels (sharper,
+// more content), as if the window were further away.
+static float g_cfgSpawnWidth  = 960.0f;
+static float g_cfgSpawnHeight = 540.0f;
 static constexpr float kSpawnDistance = 10.0f;
 
 // A normal damage cycle stops when nothing else in Hyprland changes. 3D mode is
@@ -1134,13 +1136,13 @@ static void ghostWindows(const PHLMONITOR& mon) {
         // (which belongs to whichever monitor sits at 0,0, or none at all).
         if (info.window) {
             const double CX =
-                mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
+                mon->m_position.x + mon->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
             const double CY =
-                mon->m_position.y + mon->m_size.y * 0.5 - kSpawnHeight * 0.5;
+                mon->m_position.y + mon->m_size.y * 0.5 - g_cfgSpawnHeight * 0.5;
 
             Compat::setWindowBox(
                 info.window,
-                CBox{CX, CY, kSpawnWidth, kSpawnHeight}
+                CBox{CX, CY, g_cfgSpawnWidth, g_cfgSpawnHeight}
             );
         }
 
@@ -2030,8 +2032,8 @@ static void pollFullscreen() {
                 if (auto OLDW = g_fsLastFSWindow.lock()) {
                     const auto CUR = Compat::currentWindowBox(OLDW);
 
-                    g_fsAssertBox    = CBox{CUR.x, CUR.y, kSpawnWidth,
-                                            kSpawnHeight};
+                    g_fsAssertBox    = CBox{CUR.x, CUR.y, g_cfgSpawnWidth,
+                                            g_cfgSpawnHeight};
                     g_fsAssertFrames = 1;
                     g_fsStableCount  = 0;
 
@@ -2116,7 +2118,7 @@ static void applyFullscreenAnimation() {
     // The REAL box animates between the floating box and the fullscreen box.
     // The client's buffer is stretched to this box by the compositor, so the
     // content scale inside the quad stays constant through the whole
-    // transition. On the way back the box lands at the SPAWN size (960x540):
+    // transition. On the way back the box lands at the SPAWN size (windows.spawn_width/height):
     // the post-FS size is deterministic and never inherits garbage from
     // earlier broken cycles.
     const CBox B0 = A ? g_fsRestoreBox : g_fsMonitorBox;
@@ -2508,8 +2510,8 @@ static void deactivate3D() {
     if (auto W = g_fsWindow.lock())
         Compat::setWindowBox(
             W,
-            CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
-                 kSpawnHeight});
+            CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, g_cfgSpawnWidth,
+                 g_cfgSpawnHeight});
 
     g_fsPhase        = EFullscreenPhase::None;
     g_fsWindow       = {};
@@ -2630,10 +2632,10 @@ static void enter3D() {
             Compat::setWindowBox(
                 FSW,
                 CBox{MON->m_position.x + MON->m_size.x * 0.5 -
-                         kSpawnWidth * 0.5,
+                         g_cfgSpawnWidth * 0.5,
                      MON->m_position.y + MON->m_size.y * 0.5 -
-                         kSpawnHeight * 0.5,
-                     kSpawnWidth, kSpawnHeight});
+                         g_cfgSpawnHeight * 0.5,
+                     g_cfgSpawnWidth, g_cfgSpawnHeight});
 
             g_fsLastFSWindow = FSW;
         }
@@ -4607,6 +4609,14 @@ static int luaConfig(lua_State* L) {
         // anything below is clamped up to it.
         g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
 
+        if (!SET_NUM(idx, "spawn_width", g_cfgSpawnWidth,
+                     "windows.spawn_width"))
+            return luaL_error(L, "hypr3d.config: windows.spawn_width must be a number");
+        if (!SET_NUM(idx, "spawn_height", g_cfgSpawnHeight,
+                     "windows.spawn_height"))
+            return luaL_error(L, "hypr3d.config: windows.spawn_height must be a number");
+        g_cfgSpawnWidth  = std::max(g_cfgSpawnWidth, 100.0f);
+        g_cfgSpawnHeight = std::max(g_cfgSpawnHeight, 100.0f);
         lua_pop(L, 1);
     }
 
