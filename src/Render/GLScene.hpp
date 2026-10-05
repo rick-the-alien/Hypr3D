@@ -97,6 +97,11 @@ class GLScene {
         m_debugOverlay = on;
     }
 
+    // Hidden while the typing mode frees the real cursor.
+    void setCrosshairVisible(bool on) {
+        m_crosshairVisible = on;
+    }
+
     void setDebugFps(float fps) {
         m_debugFps = fps;
     }
@@ -318,6 +323,7 @@ class GLScene {
 
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
+    bool                            m_crosshairVisible = true;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     CPlayerModel                    m_player;
