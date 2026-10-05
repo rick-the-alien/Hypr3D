@@ -460,8 +460,11 @@ static float g_rolledGravity = 1.0f;
 
 
 static bool joltInit() {
-    static bool done = false;
-    if (done)
+    // Keyed on the system itself, not a once-flag: the plugin .so is never
+    // really unmapped (Hyprland's headers give it STB_GNU_UNIQUE symbols, so
+    // dlclose is a no-op), and loading the same path again re-runs
+    // PLUGIN_INIT on these statics after joltShutdown.
+    if (g_joltSystem)
         return true;
 
     JPH::RegisterDefaultAllocator();
@@ -474,11 +477,12 @@ static bool joltInit() {
     g_joltSystem->SetGravity(JPH::Vec3(0.f, -14.f, 0.f));
 
     g_bodyIf = &g_joltSystem->GetBodyInterface();
-    done = true;
     return true;
 }
 
 static void joltShutdown() {
+    g_bodyIf = nullptr;
+
     if (g_joltSystem) {
         delete g_joltSystem;
         g_joltSystem = nullptr;
@@ -4668,6 +4672,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_deactivateLater = 0;
 
     joltShutdown();
+
+    // The bodies died with the system; stale IDs would be read by the next
+    // PLUGIN_INIT of this same mapping (see joltInit).
+    g_playerBody = {};
+    g_floorBody  = {};
+    g_joltBodies.clear();
 
     g_active = false;
     stopFramePump();
