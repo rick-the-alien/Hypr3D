@@ -1028,10 +1028,14 @@ static void ghostWindows(const PHLMONITOR& mon) {
         // A window that appears while the view is open becomes a small
         // floating panel instead of a fullscreen tile -- resized BEFORE the
         // layout save, so the box restored on exit is the same 720x480 the
-        // user actually worked with.
+        // user actually worked with. setWindowBox takes GLOBAL layout
+        // coordinates: centre on this monitor, not on the layout origin
+        // (which belongs to whichever monitor sits at 0,0, or none at all).
         if (info.window) {
-            const double CX = mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
-            const double CY = mon->m_size.y * 0.5 - kSpawnHeight * 0.5;
+            const double CX =
+                mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
+            const double CY =
+                mon->m_position.y + mon->m_size.y * 0.5 - kSpawnHeight * 0.5;
 
             Compat::setWindowBox(
                 info.window,
@@ -2454,9 +2458,11 @@ static void enter3D() {
                 Fullscreen::controller()->getFullscreenWindow(MON)) {
             Compat::setWindowBox(
                 FSW,
-                CBox{MON->m_size.x * 0.5 - kSpawnWidth * 0.5,
-                     MON->m_size.y * 0.5 - kSpawnHeight * 0.5, kSpawnWidth,
-                     kSpawnHeight});
+                CBox{MON->m_position.x + MON->m_size.x * 0.5 -
+                         kSpawnWidth * 0.5,
+                     MON->m_position.y + MON->m_size.y * 0.5 -
+                         kSpawnHeight * 0.5,
+                     kSpawnWidth, kSpawnHeight});
 
             g_fsLastFSWindow = FSW;
         }
