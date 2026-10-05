@@ -929,6 +929,7 @@ static void damageCurrentMonitor() {
 }
 
 static PHLMONITOR g_currentRenderMon = nullptr;
+static bool       g_roomDrawnThisFrame = false; // see onRenderStage
 
 // The monitor the 3D view is built for: configured monitor, or focused monitor,
 // falling back to whatever render.pre last reported.
@@ -2385,7 +2386,8 @@ static void onRenderPre(PHLMONITOR mon) {
         return;
     }
 
-    g_currentRenderMon = mon;
+    g_currentRenderMon   = mon;
+    g_roomDrawnThisFrame = false;
 
     if (!g_active) {
         g_monitor = mon;
@@ -3849,11 +3851,19 @@ static void onRenderStage(eRenderStage stage) {
     if (!g_monitor)
         return;
 
-    if (stage != RENDER_LAST_MOMENT)
+    // After the windows, before the top and overlay layers: bars,
+    // launchers and notifications draw over the room as ordinary 2D.
+    if (stage != RENDER_POST_WINDOWS)
         return;
 
     if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
         return;
+
+    // The stage fires per rendered workspace (two during a workspace
+    // switch); the room is drawn once per frame.
+    if (g_roomDrawnThisFrame)
+        return;
+    g_roomDrawnThisFrame = true;
 
     dumpStatus();
 
