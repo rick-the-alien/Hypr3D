@@ -56,6 +56,7 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Shift                         | Move down (flying)                             |
 | Ctrl                          | Sprint                                         |
 | C                             | Zoom, wheel adjusts                            |
+| V                             | Toggle noclip (fly through walls and floors)   |
 | Super + Left click            | Drag window                                    |
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |
@@ -137,6 +138,7 @@ Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 
 | move_speed       | float   | 4.0         | how fast you walk (m/s, running - 2.5x)                 |
 | spawn            | vector3 | { 0, 0, 0 } | player spawn point                                      |
 | flying           | bool    | false       | disables falling                                        |
+| noclip           | bool    | false       | pass through everything (implies flying); V toggles it  |
 | walk_bob         | bool    | true        | simulate the rhythm of walking                          |
 
 ### Scene object
