@@ -2366,6 +2366,30 @@ static void deactivate3D() {
     g_renderedOnce = false;
 }
 
+// The close transition finishes inside render.stage, i.e. between the frame's
+// startRenderPass() and endRender(). deactivate3D destroys the snapshot
+// framebuffers and restores the layout, which broke the compositor's outer
+// endRender() (SEGV in CMonitor::useFP16) -- the same failure syncWorld
+// documents. Run it from the event loop instead; PLUGIN_EXIT cancels a pending
+// call so it never runs into unloaded code.
+static uint64_t g_deactivateLater = 0;
+
+static void requestDeactivate3D() {
+    if (g_deactivateLater || !g_pEventLoopManager)
+        return;
+
+    g_deactivateLater = g_pEventLoopManager->doLater([] {
+        g_deactivateLater = 0;
+
+        // Reopened before the deferred teardown ran.
+        if (!g_active || g_transitionTarget > 0.0f)
+            return;
+
+        deactivate3D();
+        damageCurrentMonitor();
+    });
+}
+
 static void enter3D() {
     // Without this the render stage bails out immediately and the toggle does
     // nothing at all.
@@ -3357,7 +3381,7 @@ static void onRenderStage(eRenderStage stage) {
     const float dt = updateTransition();
 
     if (g_transition <= 0.0f && g_transitionTarget <= 0.0f) {
-        deactivate3D();
+        requestDeactivate3D();
         return;
     }
 
@@ -4633,6 +4657,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    if (g_deactivateLater && g_pEventLoopManager)
+        g_pEventLoopManager->removeDoLater(g_deactivateLater);
+    g_deactivateLater = 0;
+
     joltShutdown();
 
     g_active = false;
