@@ -16,6 +16,9 @@ namespace H3D {
 // main.cpp (fullscreen transition computes the screen-filling quad from it).
 static constexpr float kFovDeg = 65.0f;
 
+// Vertex count of the typing-mode cursor arrow (five triangles).
+static constexpr int kPointerVerts = 15;
+
 // The 3D view: a first-person room containing the windows of the active
 // workspace. It deliberately knows nothing about Hyprland -- main.cpp feeds it
 // WindowRender entries and reads back what the crosshair hit.
@@ -89,6 +92,30 @@ class GLScene {
     // Hidden while the typing mode frees the real cursor.
     void setCrosshairVisible(bool on) {
         m_crosshairVisible = on;
+    }
+
+    // The typing-mode cursor (an arrow). On a window it lies in the window's
+    // plane: the tip sits at a world point and one cursor pixel spans
+    // pxWorld units along the window's right/down axes, so it shares the
+    // window's perspective. Off windows it is drawn flat at a viewport point.
+    struct SPointer {
+        enum class EMode : uint8_t { Hidden, World, Screen };
+
+        EMode mode = EMode::Hidden;
+        Vec3  tip{};
+        Vec3  right{};
+        Vec3  down{};
+        float pxWorld = 0.0f;
+        float ndcX    = 0.0f; // Screen: tip in normalized device coords
+        float ndcY    = 0.0f;
+    };
+
+    void setPointer(const SPointer& pointer) {
+        m_pointer = pointer;
+    }
+
+    float zoom() const {
+        return m_zoom;
     }
 
     void setDebugFps(float fps) {
@@ -184,6 +211,7 @@ class GLScene {
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
     void drawFullscreen(float alpha);
     void drawCrosshair(int width, int height);
+    void drawPointer(const Mat4& vp, int width, int height);
 
   private:
     bool m_initialized = false;
@@ -223,6 +251,8 @@ class GLScene {
 
     unsigned int m_crosshairVAO = 0;
     unsigned int m_crosshairVBO = 0;
+    unsigned int m_pointerVAO   = 0;
+    unsigned int m_pointerVBO   = 0;
 
     int m_sceneMVP = -1;
     int m_sceneTexture = -1;
@@ -259,6 +289,7 @@ class GLScene {
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
     bool                            m_crosshairVisible = true;
+    SPointer                        m_pointer;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     float                           m_debugFps     = 0.f;
