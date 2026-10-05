@@ -127,6 +127,13 @@ Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 
 | ----------------| -------| ---------| -----------------------------------------|
 | window_scale   | float | 0.5     | window size multiplier (at 100 px/m)    |
 | spawn_distance | float | 5.0     | how far from you new windows appear (m) |
+| spawn_width    | float | 960     | pixel width new windows open at in 3D   |
+| spawn_height   | float | 540     | pixel height new windows open at in 3D  |
+
+The room size of a window is its pixel size / 100 * `window_scale`. For
+sharper windows with more room for content at the same size in the room,
+raise `spawn_width`/`spawn_height` and lower `window_scale` by the same
+factor (e.g. 1920x1080 at 0.25 matches the default 960x540 at 0.5).
 
 ### Player
 
