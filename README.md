@@ -157,6 +157,7 @@ Everything is optional -- only set what you want to change.
 | grid     | bool   | true    | the starting 40x40 platform             |
 | monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
 | under_layers | bool | false | draw the room under the top and overlay layers: bars, launchers, sidebars and notifications (e.g. Quickshell) stay 2D on top and take pointer (with `input.typing_cursor`) and keyboard input; only bottom-layer widgets join the room |
+| tools    | bool   | false   | tool slots on keys 1-5 with a HUD bar: 1 pointer, 2 curve and 3 lines draw closed paths on the ground (left-click adds a point, right-click removes one, clicking a point converts it, pressing the tool's key again starts a new path); a character dropped onto a path walks it |
 
 ### Windows
 
