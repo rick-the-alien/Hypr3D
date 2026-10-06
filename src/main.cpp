@@ -1180,7 +1180,7 @@ static std::vector<std::string> toolLabels() {
     const std::string WHICH = g_activePath >= 0 &&
             g_activePath < static_cast<int>(g_paths.size())
         ? "P" + std::to_string(g_activePath + 1) : "NEW";
-    return {"POINTER", "CURVE " + WHICH, "LINES " + WHICH, "", ""};
+    return {"CURSOR", "CURVE " + WHICH, "LINES " + WHICH, "", ""};
 }
 
 // The path point nearest a ground position (within reach), as
@@ -3644,12 +3644,21 @@ static void update3D(float dt) {
                                     g_chars[i].running);
     }
     syncCharacterBodies();
-    g_scene.setHud(g_tool, g_cfgTools ? toolLabels() : std::vector<std::string>{});
+    // The slot bar shows only while a path tool is out (slot 1 is the way
+    // back to the cursor). Paths show with a path tool, or while carrying a
+    // character that could be dropped onto one; otherwise they stay hidden
+    // (walkers keep walking them).
+    g_scene.setHud(g_tool, g_cfgTools && pathTool() ? toolLabels()
+                                                    : std::vector<std::string>{});
     {
+        const bool CARRYING = g_pointerGesture == EPointerGesture::CharDrag &&
+            g_charGrabIndex < g_chars.size();
         std::vector<GLScene::SPathView> VIEWS;
-        VIEWS.reserve(g_paths.size());
-        for (const auto& P : g_paths)
-            VIEWS.push_back({P.points, P.smooth});
+        if (pathTool() || CARRYING) {
+            VIEWS.reserve(g_paths.size());
+            for (const auto& P : g_paths)
+                VIEWS.push_back({P.points, P.smooth});
+        }
         g_scene.setPaths(VIEWS, g_activePath, pathTool());
     }
     for (size_t i = 0; i < g_chars.size(); ++i)
