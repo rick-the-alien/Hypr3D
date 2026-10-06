@@ -72,18 +72,20 @@ indicator).
 - **Mouse look while a layer has the keyboard:** in moving mode the camera
   still turns behind an open launcher.
 
-## Upstream candidates (samine825/Hypr3D)
+## Upstream (samine825/Hypr3D)
 
 - Merged: #1 multi-monitor, #2 close crash, #3 spawn box monitor offset.
-  #5 (AfrobamaYT: unload/reload crashes, async model loading, JPEG
-  textures) is merged into `rick` but still open upstream.
-- Planned PRs:
-  - **Typing mode** (free cursor, the cursor on windows, client cursor
-    images): on the existing Super + Left Alt keyboard-mode toggle,
-    enabled by a config option, with the extra toggle button (BTN_BACK)
-    assignable in config.
-  - **Quickshell/layer integration:** draw the room under the top and
-    overlay layers and hand them pointer and keyboard input, as a config
-    choice of which layer the room is drawn under.
-- Could follow: keeping monitor-sized bottom layers (wallpapers) out of
-  the room, `hl.plugin.hypr3d.active()`.
+  #5 (AfrobamaYT) was closed but mostly applied upstream as its own commits
+  (not the spawn arc); merged into `rick` 2026-10-06.
+- Open, from `rick` (2026-10-06):
+  - #6 crashes restoring windows after 3D; room takes the active workspace
+  - #7 skinning of glTF-spec exports (Mixamo/Blender)
+  - #8 specular-glossiness colours; physics hull sampling
+  - #9 typing cursor (opt-in: `input.typing_cursor`, `input.typing_button`)
+  - #10 room under the layers (opt-in: `world.under_layers`), wallpaper
+    layers kept out -- stacked on #9
+  - #11 remembered window poses
+  - #12 animated characters + tools/mixamo2glb.py -- stacked on #7
+  - #13 noclip (V), spawn_width/height, hypr3d.active()
+- Stays on `rick`: `reload.sh`, `TODO.md`, the spawn arc's skip of
+  remembered windows (upstream has no arc).
