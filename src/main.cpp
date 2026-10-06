@@ -268,6 +268,32 @@ static float g_cfgSpawnWidth  = 960.0f;
 static float g_cfgSpawnHeight = 540.0f;
 static constexpr float kSpawnDistance = 10.0f;
 
+// Room poses remembered across 3D sessions: leaving 3D saves where every
+// window and widget stood, and coming back puts them there again instead of
+// spawning them in front of the camera. Plugin memory only -- a reload or a
+// restart starts fresh. Keyed by address, guarded by a weak reference so a
+// new window reusing a closed one's address starts fresh too. The size is
+// not stored: it always follows the window's real box.
+struct SRememberedPose {
+    PHLWINDOWREF window;
+    PHLLSREF     layer;
+    Vec3         center{};
+    float        yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+};
+static std::unordered_map<std::uintptr_t, SRememberedPose> g_rememberedPoses;
+
+static const SRememberedPose* rememberedPose(const Compat::SWindowInfo& info) {
+    const auto IT = g_rememberedPoses.find(info.id);
+    if (IT == g_rememberedPoses.end())
+        return nullptr;
+
+    const bool SAME = info.isLayer ?
+        info.layer && IT->second.layer.lock() == info.layer :
+        info.window && IT->second.window.lock() == info.window;
+
+    return SAME ? &IT->second : nullptr;
+}
+
 // A normal damage cycle stops when nothing else in Hyprland changes. 3D mode is
 // itself an animated scene, so keep a small render pump alive while it is open.
 // 8 ms targets roughly 120 Hz without making the event loop spin continuously.
@@ -1419,6 +1445,13 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
         }
+        else if (const auto* SAVED = rememberedPose(info)) {
+            // Back from an earlier 3D session: where it was left.
+            entity.center = SAVED->center;
+            entity.yaw    = SAVED->yaw;
+            entity.pitch  = SAVED->pitch;
+            entity.roll   = SAVED->roll;
+        }
         else {
             const auto& CAM = g_scene.camera();
             const Vec3 FWD = CAM.forward();
@@ -2411,7 +2444,46 @@ static void onRenderPre(PHLMONITOR mon) {
 
 // --- lifecycle --------------------------------------------------------------
 
+// Saves every room entity's pose for the next 3D session (see
+// g_rememberedPoses); closed windows are pruned on the way.
+static void rememberPoses() {
+    std::erase_if(g_rememberedPoses, [](const auto& KV) {
+        return KV.second.window.expired() && KV.second.layer.expired();
+    });
+
+    const auto FSW = g_fsWindow.lock();
+
+    for (const auto& E : g_world.entities()) {
+        const auto TARGET = targetFromHit(E.id);
+        if (!TARGET.window && !TARGET.layer)
+            continue;
+
+        SRememberedPose POSE;
+        POSE.window = TARGET.window;
+        POSE.layer  = TARGET.layer;
+
+        // A window caught in a fullscreen transition (or in 2D fullscreen)
+        // keeps the pose it had before going fullscreen.
+        if (g_fsPhase != EFullscreenPhase::None && FSW &&
+            Compat::windowId(FSW) == E.id) {
+            POSE.center = g_fsStartCenter;
+            POSE.yaw    = g_fsStartYaw;
+            POSE.pitch  = g_fsStartPitch;
+            POSE.roll   = g_fsSavedRoll;
+        } else {
+            POSE.center = E.center;
+            POSE.yaw    = E.yaw;
+            POSE.pitch  = E.pitch;
+            POSE.roll   = E.roll;
+        }
+
+        g_rememberedPoses[E.id] = POSE;
+    }
+}
+
 static void deactivate3D() {
+    rememberPoses();
+
     finishClientButton(0);
     resetPointerGesture();
 
