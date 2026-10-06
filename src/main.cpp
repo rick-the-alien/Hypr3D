@@ -1089,6 +1089,9 @@ static void ghostWindows(const PHLMONITOR& mon) {
         g_layoutSaves.reserve(INFOS.size());
 
         for (const auto& info : INFOS) {
+            if (info.attached)
+                continue; // popups and X11 menus are no layout targets
+
             auto SAVE = Compat::saveWindowLayout(info.window);
 
             if (SAVE.window)
@@ -1108,6 +1111,9 @@ static void ghostWindows(const PHLMONITOR& mon) {
     // around it. The live weak reference guards against a new window reusing
     // a closed one's address.
     for (const auto& info : INFOS) {
+        if (info.attached)
+            continue; // popups and X11 menus are no layout targets
+
         bool known = false;
 
         for (const auto& save : g_layoutSaves) {
@@ -1126,7 +1132,8 @@ static void ghostWindows(const PHLMONITOR& mon) {
         // user actually worked with. setWindowBox takes GLOBAL layout
         // coordinates: centre on this monitor, not on the layout origin
         // (which belongs to whichever monitor sits at 0,0, or none at all).
-        if (info.window) {
+        // A dialog (a window with a parent) keeps the size it asked for.
+        if (info.window && !info.window->parent()) {
             const double CX =
                 mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
             const double CY =
@@ -1295,6 +1302,8 @@ static void refreshCaptures(
 
         if (info.isLayer)
             g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
+        else if (info.popup.lock())
+            g_capture.makeSnapshotPopup(info.popup, info.monitorLocalBox, mon, FORCE);
         else
             g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
     }
@@ -1329,6 +1338,17 @@ static void serviceCapture() {
     g_capturing = false;
 }
 
+// Attached surfaces (popups, X11 menus) -> their parent window's id, as of
+// the last syncWorld. Focus never goes to an attached surface itself: a menu
+// is used while its parent keeps the keyboard, and focusing anything else
+// (or nothing) dismisses it.
+static std::unordered_map<std::uintptr_t, std::uintptr_t> g_attachParent;
+
+static std::uintptr_t focusIdFor(std::uintptr_t id) {
+    const auto IT = g_attachParent.find(id);
+    return IT == g_attachParent.end() ? id : IT->second;
+}
+
 // Handoff the keyboard to whatever the crosshair is on -- and to nothing else.
 // Aiming at empty space drops focus entirely rather than leaving the last
 // window typed into.
@@ -1343,7 +1363,7 @@ static void updateAimFocus(float dt) {
 
     // A scene model in front of the aimed window occludes it: no window
     // focus through geometry (one distance space for both classes).
-    std::uintptr_t AIMED = HIT.hit ? HIT.id : 0;
+    std::uintptr_t AIMED = HIT.hit ? focusIdFor(HIT.id) : 0;
     if (AIMED != 0 && modelInFront(cam.position, cam.centerRay(), HIT))
         AIMED = 0;
     g_lastAimedId = AIMED;
@@ -1392,7 +1412,34 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // monitor blur FBs; the compositor's outer endRender() then aborted in
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    auto INFOS = Compat::enumerateEligibleWindows(mon);
+
+    // Attached surfaces (popups, X11 menus) come after every window, so each
+    // finds its parent's entity already built this frame. An X11 menu whose
+    // X server named no parent belongs to the window that had focus when it
+    // appeared -- remembered, so it does not wander as focus moves.
+    {
+        static std::unordered_map<std::uintptr_t, std::uintptr_t> s_menuParent;
+        std::unordered_map<std::uintptr_t, std::uintptr_t> seen;
+        for (auto& I : INFOS) {
+            if (!I.attached || I.parentId != 0)
+                continue;
+            auto IT = s_menuParent.find(I.id);
+            const std::uintptr_t P =
+                IT != s_menuParent.end() ? IT->second : g_lastFocusId;
+            I.parentId = P;
+            seen[I.id] = P;
+        }
+        s_menuParent = std::move(seen);
+
+        std::stable_partition(INFOS.begin(), INFOS.end(),
+                              [](const auto& I) { return !I.attached; });
+
+        g_attachParent.clear();
+        for (const auto& I : INFOS)
+            if (I.attached && I.parentId)
+                g_attachParent[I.id] = I.parentId;
+    }
 
     g_winOutlines.clear();
 
@@ -1490,17 +1537,95 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // Seed pose: existing entities own their world position and rotation.
         // NEW windows spawn straight in front of the camera at a fixed read
         // distance, facing it.
-        if (const auto* EXISTING = g_world.find(info.id)) {
+        if (info.attached) {
+            // Popups and X11 menus sit on their parent window's plane at
+            // their real offset from it (so a menu opens where it was
+            // clicked), a hair in front of its face, and follow it.
+            const World3D::SEntity* PARENT = nullptr;
+            for (const auto& E : ENTITIES)
+                if (E.id == info.parentId)
+                    PARENT = &E;
+            const Compat::SWindowInfo* PINFO = nullptr;
+            for (const auto& I : INFOS)
+                if (I.id == info.parentId)
+                    PINFO = &I;
+            // Drawn once the parent is in the room (its axes come from it).
+            if (!PARENT || !PINFO || !g_world.find(info.parentId) ||
+                PARENT->logicalWidth <= 0 || PARENT->logicalHeight <= 0)
+                continue;
+
+            const double OX = info.monitorLocalBox.x - PINFO->monitorLocalBox.x;
+            const double OY = info.monitorLocalBox.y - PINFO->monitorLocalBox.y;
+            const float  CX = static_cast<float>(OX + info.monitorLocalBox.w * 0.5);
+            const float  CY = static_cast<float>(OY + info.monitorLocalBox.h * 0.5);
+
+            const float X = (CX / PARENT->logicalWidth - 0.5f) * PARENT->width;
+            const float Y = (0.5f - CY / PARENT->logicalHeight) * PARENT->height;
+            entity.center = PARENT->center + g_world.rightOf(PARENT->id) * X +
+                g_world.upOf(PARENT->id) * Y +
+                g_world.normalOf(PARENT->id) * (g_cfgWindowDepth * 0.5f + 0.01f);
+            entity.yaw        = PARENT->yaw;
+            entity.pitch      = PARENT->pitch;
+            entity.roll       = PARENT->roll;
+            entity.spawnScale = PARENT->spawnScale;
+
+            // A popup's hits are delivered to its parent window in the
+            // parent's surface space (the delivery finds the popup there).
+            if (info.popup.lock()) {
+                const float SX = static_cast<float>(OX - PINFO->surfaceOffset.x);
+                const float SY = static_cast<float>(OY - PINFO->surfaceOffset.y);
+                entity.surfaceOffsetX = -SX;
+                entity.surfaceOffsetY = -SY;
+                entity.surfaceWidth   = SX + static_cast<float>(info.monitorLocalBox.w);
+                entity.surfaceHeight  = SY + static_cast<float>(info.monitorLocalBox.h);
+            }
+        }
+        else if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
         }
+        else if (info.window && info.window->parent() &&
+                 !g_world.find(Compat::windowId(info.window->parent())) &&
+                 std::any_of(INFOS.begin(), INFOS.end(), [&](const auto& I) {
+                     return I.id == Compat::windowId(info.window->parent());
+                 })) {
+            // Its parent is new to the room too (both mapped this frame):
+            // wait a frame for the parent's pose instead of spawning at the
+            // same spot and fighting it for depth.
+            continue;
+        }
+        else if (const auto* DIALOG_PARENT =
+                     info.window && info.window->parent()
+                         ? g_world.find(Compat::windowId(info.window->parent()))
+                         : nullptr) {
+            // A dialog (file chooser, preferences) opens just in front of the
+            // window that asked for it, facing the same way.
+            entity.center = DIALOG_PARENT->center +
+                g_world.normalOf(DIALOG_PARENT->id) * 0.3f;
+            entity.yaw   = DIALOG_PARENT->yaw;
+            entity.pitch = DIALOG_PARENT->pitch;
+            entity.roll  = DIALOG_PARENT->roll;
+        }
         else {
             const auto& CAM = g_scene.camera();
             const Vec3 FWD = CAM.forward();
 
-            entity.center = CAM.position + FWD * g_cfgSpawnDistance;
+            // Never on the far side of a wall: a spawn point behind scene
+            // geometry comes forward to just in front of it. Nor inside a
+            // window already there: windows opened one after another without
+            // moving would share the spot and fight for depth, so the new
+            // one stands just in front of whatever window is in the way.
+            float dist = g_cfgSpawnDistance;
+            if (const auto WALL = modelRayHit(CAM.position, FWD, false);
+                WALL.hit && WALL.dist < dist + 0.3f)
+                dist = std::max(0.6f, WALL.dist - 0.3f);
+            if (const auto WIN = g_world.pick(CAM.position, FWD);
+                WIN.hit && WIN.distance < dist + 0.15f)
+                dist = std::max(0.5f, WIN.distance - 0.15f);
+
+            entity.center = CAM.position + FWD * dist;
 
             // Face the camera: with this model's convention (the normal's Y
             // component is -sin(pitch)) the target is the camera's own yaw
@@ -1716,7 +1841,27 @@ static SHitTarget targetFromHit(std::uintptr_t id) {
     if (!target.layer)
         target.window = Compat::findWindowById(id);
 
+    // A popup's input goes to its parent window in the parent's surface
+    // space (the entity maps hits there); the delivery finds the popup under
+    // the point.
+    if (!target.layer && !target.window)
+        target.window = Compat::findPopupParentById(id);
+
     return target;
+}
+
+// Focus for a window hit in the room: an X11 menu (attached) hands it to its
+// parent instead.
+static void focusRoomWindow(const PHLWINDOW& window) {
+    if (!window)
+        return;
+    const auto ID = Compat::windowId(window);
+    if (const auto PARENT_ID = focusIdFor(ID); PARENT_ID != ID) {
+        if (const auto PARENT = Compat::findWindowById(PARENT_ID))
+            Compat::focusWindow(PARENT);
+        return;
+    }
+    Compat::focusWindow(window);
 }
 
 static bool rayPlanePoint(
@@ -4110,7 +4255,7 @@ static void onMouseButton(
         const auto& CAM = g_scene.camera();
 
         if (TARGET.window)
-            Compat::focusWindow(TARGET.window);
+            focusRoomWindow(TARGET.window);
 
         // Resize is a window-only control: a scene model in front of the
         // crosshair must not let the gesture reach a window behind it.
@@ -4205,7 +4350,7 @@ static void onMouseButton(
 
     if (PRESSED) {
         if (TARGET.window)
-            Compat::focusWindow(TARGET.window);
+            focusRoomWindow(TARGET.window);
 
         if (TARGET.layer)
             Compat::deliverClick(TARGET.layer, LOCAL, event.button, true, event.timeMs);
