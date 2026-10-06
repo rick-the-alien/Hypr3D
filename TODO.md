@@ -49,6 +49,15 @@ indicator).
 
 ## Loose ends
 
+- **Scene changes need a plugin reload:** switching `scene.map.path` (and
+  its transform) in the config and running `hyprctl reload` did not load
+  the new model; it only appeared after `reload.sh`. Probably the scene
+  object keeps its loaded model across a config reload when only the path
+  changes, or the async load (PR #5) is not restarted.
+- **Spawning inside scans:** photogrammetry scans often have objects (trees,
+  lamps, vehicles) at their centre. Centring a model on the spawn can put
+  the player inside one; a spawn check (or "find open ground") would help.
+
 - **Natural scrolling:** scrolling a window under the typing-mode cursor
   sends the raw wheel delta; it may ignore `input:natural_scroll` and the
   scroll factor.
