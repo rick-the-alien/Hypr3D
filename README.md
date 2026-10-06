@@ -197,6 +197,32 @@ Everything is optional -- only set what you want to change.
 Want only part of a model to be solid? Rename those nodes in Blender to
 start with `nocol` -- they'll still render, but you'll walk right through.
 
+### <a name="characters"></a> Characters
+
+`characters = { name = { ... }, ... }`: animated (skinned) glTF models that
+play their clips in place. Each time a clip ends, one of the `idle` clips is
+picked at random (never the same one twice in a row when there's a choice) and
+crossfaded in. No collision or physics yet.
+
+| Option    | Type                         | Default  | Description                                   |
+| -----------| ------------------------------| ----------| -----------------------------------------------|
+| path      | string                       | ""       | the model file (.glb/.gltf) with its animations |
+| transform | [transform](#transform)      |          | position of the feet, rotation, scale         |
+| flat      | bool                         | false    | raw texture, no headlight shading             |
+| idle      | list of strings              | all      | clip names to pick between                    |
+
+Mixamo exports the character and each animation as separate FBX files.
+`tools/mixamo2glb.py` merges them into one `.glb` with a named animation per
+clip (Blender 4.4+):
+
+```sh
+blender -b -P tools/mixamo2glb.py -- path/to/mixamo-folder out.glb
+```
+
+The folder holds `character.fbx` plus the animation FBXs (or a
+`character.json` listing them); each clip is named after its file
+(`idle.alt1.fbx` → `idle.alt1`).
+
 ### <a name="mesh"></a> Mesh
 
 | Option         | Type                    | Default   | Description                         |
