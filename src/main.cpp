@@ -999,6 +999,7 @@ struct SCharState {
     // along it. The character advances by its walk clip's own root motion.
     int   path = -1;
     float along = 0.f;
+    bool  running = false; // double-click toggles walk / run
     Vec3  lastRoot{};
     float lastStep = 0.f;
 };
@@ -3636,7 +3637,8 @@ static void update3D(float dt) {
     for (size_t i = 0; i < g_chars.size(); ++i) {
         if (i != g_charGrabIndex && g_chars[i].path >= 0)
             walkCharacter(i, dt);
-        g_scene.setCharacterWalking(i, i != g_charGrabIndex && g_chars[i].path >= 0);
+        g_scene.setCharacterWalking(i, i != g_charGrabIndex && g_chars[i].path >= 0,
+                                    g_chars[i].running);
     }
     syncCharacterBodies();
     g_scene.setHud(g_tool, toolLabels());
@@ -5266,6 +5268,37 @@ static void onMouseButton(
         return;
     }
 
+    // A character under the crosshair (nearer than any window) owns plain
+    // left clicks with the pointer tool: a double-click switches it between
+    // walking and running. Never reaches a client behind it.
+    if (g_tool == static_cast<int>(ETool::Pointer) && !g_superHeld &&
+        event.button == BTN_LEFT) {
+        const auto& CAM = g_scene.camera();
+        float charT = 0.f;
+        const size_t CHAR = pickCharacter(CAM.position, CAM.centerRay(), charT);
+        const World3D::SHit WIN = aimHit();
+
+        if (CHAR != SIZE_MAX && (!WIN.hit || charT < WIN.distance)) {
+            static size_t   s_lastChar = SIZE_MAX;
+            static uint32_t s_lastTime = 0;
+            if (PRESSED) {
+                if (CHAR == s_lastChar && event.timeMs - s_lastTime < 400) {
+                    g_chars[CHAR].running = !g_chars[CHAR].running;
+                    notify(g_chars[CHAR].running ? "[hypr3d] running" :
+                                                   "[hypr3d] walking",
+                           CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+                    s_lastChar = SIZE_MAX;
+                } else {
+                    s_lastChar = CHAR;
+                    s_lastTime = event.timeMs;
+                }
+                g_swallowRelease = event.button;
+            }
+            info.cancelled = true;
+            return;
+        }
+    }
+
     // Super + wheel-press: grab the aimed window's roll around its normal.
     // Sweeping the crosshair around the window center then rotates the
     // window by the swept angle; release ends it. Never reaches the client.
@@ -6478,8 +6511,9 @@ static int luaConfig(lua_State* L) {
                                       C.name.c_str());
                 C.radius = std::max(0.05f, RADIUS);
                 C.height = std::max(0.1f, HEIGHT);
-                if (!SET_STRING(CIDX, "walk", C.walk, "characters.<name>.walk"))
-                    return luaL_error(L, "hypr3d.config: characters.%s.walk must be a clip name",
+                if (!SET_STRING(CIDX, "walk", C.walk, "characters.<name>.walk") ||
+                    !SET_STRING(CIDX, "run", C.run, "characters.<name>.run"))
+                    return luaL_error(L, "hypr3d.config: characters.%s: walk and run must be clip names",
                                       C.name.c_str());
 
                 if (!C.path.empty())
@@ -6513,6 +6547,7 @@ static int luaConfig(lua_State* L) {
                     ST.yawDeg = OLD.yawDeg;
                     ST.path   = OLD.path;
                     ST.along  = OLD.along;
+                    ST.running = OLD.running;
                 }
                 // The body is rebuilt when its size changed.
                 if (OLD.radius == ST.radius && OLD.height == ST.height)
