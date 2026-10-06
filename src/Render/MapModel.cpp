@@ -8,7 +8,8 @@
 #include "World/MapCollision.hpp"
 
 #include <hyprgraphics/image/Image.hpp>
-#include <turbojpeg.h>
+
+#include "../../third_party/stb_image.h"
 #include <hyprutils/memory/SharedPtr.hpp>
 
 #include <algorithm>
@@ -219,65 +220,24 @@ struct CMapModel::SDecoded {
 
 namespace {
 
-// An embedded JPEG as RGBA rows, the top row first. hyprgraphics reads only
-// PNG, AVIF and SVG from memory ("Currently only PNG and AVIF images are
-// supported for embedding"), and a .glb embeds JPEGs as often -- Khronos'
-// DamagedHelmet all five, and the model came out black. libjpeg-turbo is the
-// decoder hyprgraphics itself uses for JPEG files, so it is in the
-// compositor already. A model is a file from anywhere, decoded inside the
-// compositor: the limits libjpeg-turbo names for untrusted input are set
-// (progressive scans as in its own fuzzers, at most 8192x8192 pixels).
-bool decodeJpeg(const uint8_t* data, size_t size, int& w, int& h,
-                std::vector<unsigned char>& rgba) {
-    if (size < 3 || data[0] != 0xFF || data[1] != 0xD8 || data[2] != 0xFF)
-        return false;
-
-    const std::unique_ptr<void, decltype(&tj3Destroy)> TJ{tj3Init(TJINIT_DECOMPRESS),
-                                                          tj3Destroy};
-    if (!TJ)
-        return false;
-
-    tj3Set(TJ.get(), TJPARAM_SCANLIMIT, 500);
-    tj3Set(TJ.get(), TJPARAM_MAXPIXELS, 8192 * 8192);
-    tj3Set(TJ.get(), TJPARAM_MAXMEMORY, 512);
-
-    if (tj3DecompressHeader(TJ.get(), data, size) != 0)
-        return false;
-
-    const int W = tj3Get(TJ.get(), TJPARAM_JPEGWIDTH);
-    const int H = tj3Get(TJ.get(), TJPARAM_JPEGHEIGHT);
-    if (W <= 0 || H <= 0)
-        return false;
-
-    rgba.resize(static_cast<size_t>(W) * H * 4);
-    if (tj3Decompress8(TJ.get(), data, size, rgba.data(), 0, TJPF_RGBA) != 0) {
-        rgba.clear();
-        return false;
-    }
-
-    w = W;
-    h = H;
-    return true;
-}
-
 // One glTF image as RGBA rows, the top row first. Leaves rgba empty when the
 // image cannot be read.
 void decodeImage(const std::string& modelDir, const cgltf_image* image, int& w,
                  int& h, std::vector<unsigned char>& rgba) {
     std::unique_ptr<Hyprgraphics::CImage> img;
 
+    const uint8_t* embedded = nullptr;
+    size_t         embeddedSize = 0;
+
     if (image->buffer_view) {
         const auto* BV   = image->buffer_view;
         const auto* BASE = static_cast<const uint8_t*>(cgltf_buffer_view_data(BV));
         if (!BASE)
             return;
+        embedded     = BASE;
+        embeddedSize = BV->size;
         img = std::make_unique<Hyprgraphics::CImage>(
             std::span<const uint8_t>{BASE, BV->size}, Hyprgraphics::IMAGE_FORMAT_AUTO);
-
-        if (!img->success()) {
-            decodeJpeg(BASE, BV->size, w, h, rgba);
-            return;
-        }
     } else if (image->uri && !std::string_view{image->uri}.starts_with("data:")) {
         img = std::make_unique<Hyprgraphics::CImage>(modelDir + "/" + image->uri);
     } else {
@@ -286,8 +246,26 @@ void decodeImage(const std::string& modelDir, const cgltf_image* image, int& w,
 
     auto surface = (img && img->success()) ? img->cairoSurface() : nullptr;
 
-    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS)
+    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS) {
+        // hyprgraphics decodes only PNG, AVIF and SVG from memory, and a .glb
+        // embeds other formats as often (all five images of Khronos'
+        // DamagedHelmet.glb are image/jpeg). A failed embedded image falls
+        // back to the vendored stb_image -- the same decoder PlayerModel.cpp
+        // implements -- which auto-detects JPEG, PNG, BMP, TGA, GIF, PSD, HDR,
+        // PIC and PNM from bytes. stb's rows are top-first RGBA with straight
+        // alpha, exactly what the cairo conversion below produces.
+        if (embedded) {
+            int W = 0, H = 0, COMP = 0;
+            if (auto* PX = stbi_load_from_memory(
+                    embedded, static_cast<int>(embeddedSize), &W, &H, &COMP, 4)) {
+                rgba.assign(PX, PX + static_cast<size_t>(W) * H * 4);
+                stbi_image_free(PX);
+                w = W;
+                h = H;
+            }
+        }
         return;
+    }
 
     const int W      = static_cast<int>(surface->size().x);
     const int H      = static_cast<int>(surface->size().y);

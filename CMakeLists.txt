@@ -102,7 +102,6 @@ pkg_check_modules(PIXMAN REQUIRED IMPORTED_TARGET pixman-1)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
-pkg_check_modules(TURBOJPEG REQUIRED IMPORTED_TARGET libturbojpeg)
 
 add_library(hypr3d SHARED
     src/main.cpp
@@ -132,7 +131,6 @@ target_include_directories(hypr3d
 
 target_link_libraries(hypr3d PRIVATE
     PkgConfig::HYPRGRAPHICS
-    PkgConfig::TURBOJPEG
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
     PkgConfig::XKBCOMMON
