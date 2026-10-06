@@ -2243,77 +2243,146 @@ const unsigned char* GLScene::probeRGBA() const {
 
     // F3 HUD text: a streaming quad per set font bit, screen-space ortho.
 // font8x8 is public domain (daniel hepper / marcel sondaar).
-// The drawn path: a thin ribbon lying on the ground along the closed curve
-// (Catmull-Rom through the points, or straight segments), plus a marker on
-// every point while it is being edited. World space, depth-tested, so walls
-// hide it like everything else.
-void GLScene::drawPath(const Mat4& vp) {
-    const size_t N = m_pathPoints.size();
+// Cubic Hermite through point i -> i+1 of a closed path. A smooth point's
+// tangent is the Catmull-Rom one (half the chord between its neighbours); a
+// sharp point's is zero, so the curve arrives at and leaves it straight -- a
+// corner. Two sharp ends make a straight segment.
+Vec3 GLScene::pathPoint(const SPathView& p, size_t i, float t) {
+    const size_t N = p.points.size();
     if (N == 0)
-        return;
+        return {};
+    if (N == 1)
+        return p.points[0];
 
-    std::vector<Vec3> line;
-    if (N >= 3 && m_pathSmooth) {
-        constexpr int STEPS = 16;
-        for (size_t i = 0; i < N; ++i) {
-            const Vec3& P0 = m_pathPoints[(i + N - 1) % N];
-            const Vec3& P1 = m_pathPoints[i];
-            const Vec3& P2 = m_pathPoints[(i + 1) % N];
-            const Vec3& P3 = m_pathPoints[(i + 2) % N];
-            for (int k = 0; k < STEPS; ++k) {
-                const float T = static_cast<float>(k) / STEPS;
-                const float T2 = T * T, T3 = T2 * T;
-                line.push_back((P1 * 2.0f + (P2 - P0) * T +
-                                (P0 * 2.0f - P1 * 5.0f + P2 * 4.0f - P3) * T2 +
-                                (P1 * 3.0f - P0 - P2 * 3.0f + P3) * T3) *
-                               0.5f);
-            }
-        }
-    } else
-        line = m_pathPoints;
-    if (line.size() >= 2)
-        line.push_back(line.front()); // closed
+    const size_t I0 = (i + N - 1) % N, I1 = i % N, I2 = (i + 1) % N,
+                 I3 = (i + 2) % N;
+    const Vec3& P1 = p.points[I1];
+    const Vec3& P2 = p.points[I2];
+    const Vec3  M1 = (I1 < p.smooth.size() && p.smooth[I1])
+        ? (P2 - p.points[I0]) * 0.5f : Vec3{};
+    const Vec3  M2 = (I2 < p.smooth.size() && p.smooth[I2])
+        ? (p.points[I3] - P1) * 0.5f : Vec3{};
+
+    const float T2 = t * t, T3 = T2 * t;
+    return P1 * (2.f * T3 - 3.f * T2 + 1.f) + M1 * (T3 - 2.f * T2 + t) +
+        P2 * (-2.f * T3 + 3.f * T2) + M2 * (T3 - T2);
+}
+
+// The paths: thin ribbons lying on the ground along each closed curve, and,
+// while editing, the point shapes, the start/end rings and the direction
+// chevron. World space, depth-tested, so walls hide them.
+void GLScene::drawPath(const Mat4& vp) {
+    if (m_paths.empty())
+        return;
 
     constexpr float LIFT = 0.03f; // above the floor it lies on
     constexpr float HALF = 0.03f; // ribbon half width
-    constexpr float MARK = 0.12f; // marker half size
+    constexpr float MARK = 0.12f; // point shape half size
+    constexpr int   STEPS = 16;   // samples per segment
 
-    std::vector<float> verts;
-    const auto TRI = [&](const Vec3& a, const Vec3& b, const Vec3& c) {
+    // One vertex list per colour; drawn in order at the end.
+    std::vector<float> ribbonOn, ribbonOff, marks, start, end;
+
+    const auto TRI = [](std::vector<float>& v, const Vec3& a, const Vec3& b,
+                        const Vec3& c) {
         for (const Vec3* P : {&a, &b, &c})
-            verts.insert(verts.end(), {P->x, P->y + LIFT, P->z, 0.f, 0.f});
+            v.insert(v.end(), {P->x, P->y + LIFT, P->z, 0.f, 0.f});
     };
-
-    for (size_t i = 0; i + 1 < line.size(); ++i) {
-        const Vec3& A = line[i];
-        const Vec3& B = line[i + 1];
-        const float DX = B.x - A.x, DZ = B.z - A.z;
+    // A flat band between two ground points.
+    const auto BAND = [&](std::vector<float>& v, const Vec3& a, const Vec3& b,
+                          float half) {
+        const float DX = b.x - a.x, DZ = b.z - a.z;
         const float LEN = std::sqrt(DX * DX + DZ * DZ);
         if (LEN < 1e-4f)
-            continue;
-        const Vec3 SIDE{-DZ / LEN * HALF, 0.f, DX / LEN * HALF};
-        TRI(A - SIDE, A + SIDE, B + SIDE);
-        TRI(A - SIDE, B + SIDE, B - SIDE);
-    }
-    const size_t RIBBON = verts.size() / 5;
-
-    // Diamonds on the points; the first one (where the loop closes) is drawn
-    // in its own colour.
-    size_t firstMark = 0;
-    if (m_pathEditing) {
-        for (size_t i = 0; i < N; ++i) {
-            if (i == 1)
-                firstMark = verts.size() / 5;
-            const Vec3& C = m_pathPoints[i];
-            const Vec3 X{MARK, 0.f, 0.f}, Z{0.f, 0.f, MARK};
-            TRI(C - X, C - Z, C + X);
-            TRI(C - X, C + X, C + Z);
+            return;
+        const Vec3 SIDE{-DZ / LEN * half, 0.f, DX / LEN * half};
+        TRI(v, a - SIDE, a + SIDE, b + SIDE);
+        TRI(v, a - SIDE, b + SIDE, b - SIDE);
+    };
+    // A filled disc (smooth point) or square (sharp point).
+    const auto SHAPE = [&](std::vector<float>& v, const Vec3& c, bool round,
+                           float r) {
+        const int SIDES = round ? 12 : 4;
+        const float TURN = round ? 0.f : 0.78539816f; // square: axis-aligned
+        for (int k = 0; k < SIDES; ++k) {
+            const float A0 = TURN + 6.2831853f * k / SIDES;
+            const float A1 = TURN + 6.2831853f * (k + 1) / SIDES;
+            const float R = round ? r : r * 1.41421356f;
+            TRI(v, c, c + Vec3{std::cos(A0) * R, 0.f, std::sin(A0) * R},
+                c + Vec3{std::cos(A1) * R, 0.f, std::sin(A1) * R});
         }
-        if (N == 1)
-            firstMark = verts.size() / 5;
+    };
+    // A ring around a point (start / end).
+    const auto RING = [&](std::vector<float>& v, const Vec3& c, float r) {
+        constexpr int SIDES = 16;
+        for (int k = 0; k < SIDES; ++k) {
+            const float A0 = 6.2831853f * k / SIDES;
+            const float A1 = 6.2831853f * (k + 1) / SIDES;
+            BAND(v, c + Vec3{std::cos(A0) * r, 0.f, std::sin(A0) * r},
+                 c + Vec3{std::cos(A1) * r, 0.f, std::sin(A1) * r}, 0.025f);
+        }
+    };
+
+    for (size_t pi = 0; pi < m_paths.size(); ++pi) {
+        const auto& P = m_paths[pi];
+        const size_t N = P.points.size();
+        if (N == 0)
+            continue;
+        const bool ACTIVE = static_cast<int>(pi) == m_pathActive;
+
+        // The closed curve, segment by segment.
+        if (N >= 2) {
+            auto& RIBBON = ACTIVE ? ribbonOn : ribbonOff;
+            for (size_t i = 0; i < N; ++i) {
+                Vec3 prev = pathPoint(P, i, 0.f);
+                for (int k = 1; k <= STEPS; ++k) {
+                    const Vec3 NEXT = pathPoint(P, i, static_cast<float>(k) / STEPS);
+                    BAND(RIBBON, prev, NEXT, HALF);
+                    prev = NEXT;
+                }
+            }
+        }
+
+        if (!m_pathEditing)
+            continue;
+
+        for (size_t i = 0; i < N; ++i)
+            SHAPE(marks, P.points[i], i < P.smooth.size() && P.smooth[i], MARK);
+
+        RING(start, P.points[0], MARK * 2.2f);
+        if (N >= 2) {
+            RING(end, P.points[N - 1], MARK * 2.2f);
+
+            // Direction chevron a little way along the first segment.
+            const Vec3 A = pathPoint(P, 0, 0.30f);
+            const Vec3 B = pathPoint(P, 0, 0.34f);
+            const float DX = B.x - A.x, DZ = B.z - A.z;
+            const float LEN = std::sqrt(DX * DX + DZ * DZ);
+            if (LEN > 1e-5f) {
+                const Vec3 F{DX / LEN * 0.14f, 0.f, DZ / LEN * 0.14f};
+                const Vec3 S{-F.z, 0.f, F.x};
+                BAND(start, A - F + S, A, 0.025f);
+                BAND(start, A - F - S, A, 0.025f);
+            }
+        }
     }
-    const size_t TOTAL = verts.size() / 5;
-    if (TOTAL == 0)
+
+    std::vector<float> verts;
+    struct SRange { size_t first, count; float r, g, b, a; };
+    std::vector<SRange> ranges;
+    const auto ADD = [&](const std::vector<float>& v, float r, float g,
+                         float b, float a) {
+        if (v.empty())
+            return;
+        ranges.push_back({verts.size() / 5, v.size() / 5, r, g, b, a});
+        verts.insert(verts.end(), v.begin(), v.end());
+    };
+    ADD(ribbonOff, 0.25f, 0.85f, 1.0f, 0.4f);
+    ADD(ribbonOn, 0.25f, 0.85f, 1.0f, 0.95f);
+    ADD(marks, 1.0f, 1.0f, 1.0f, 1.0f);
+    ADD(start, 0.3f, 1.0f, 0.4f, 1.0f);
+    ADD(end, 1.0f, 0.6f, 0.15f, 1.0f);
+    if (verts.empty())
         return;
 
     if (!m_pathVAO) {
@@ -2346,19 +2415,10 @@ void GLScene::drawPath(const Mat4& vp) {
     glEnable(GL_BLEND);
     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 
-    if (RIBBON) {
-        glUniform4f(m_sceneColorUniform, 0.25f, 0.85f, 1.0f, 0.9f);
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(RIBBON));
-    }
-    if (m_pathEditing && TOTAL > RIBBON) {
-        glUniform4f(m_sceneColorUniform, 0.3f, 1.0f, 0.4f, 1.0f); // start
-        glDrawArrays(GL_TRIANGLES, static_cast<GLint>(RIBBON),
-                     static_cast<GLint>(firstMark - RIBBON));
-        if (TOTAL > firstMark) {
-            glUniform4f(m_sceneColorUniform, 1.0f, 1.0f, 1.0f, 1.0f);
-            glDrawArrays(GL_TRIANGLES, static_cast<GLint>(firstMark),
-                         static_cast<GLint>(TOTAL - firstMark));
-        }
+    for (const auto& R : ranges) {
+        glUniform4f(m_sceneColorUniform, R.r, R.g, R.b, R.a);
+        glDrawArrays(GL_TRIANGLES, static_cast<GLint>(R.first),
+                     static_cast<GLint>(R.count));
     }
 
     glDepthMask(GL_TRUE);
