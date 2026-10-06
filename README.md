@@ -66,7 +66,7 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |
 | Super + Mouse wheel scrolling | Zoom window                                    |
-| Super + Left Alt / Back button | Toggle typing mode: the view freezes and a cursor appears on the windows, moving in each window's own pixels (click, drag-select, scroll as usual); past the room's edge it continues onto the other monitors |
+| Super + Left Alt              | Toggle keyboard mode (movement / window input); see `input` for a cursor in window mode |
 | F3                            | Toggle debug HUD                               |
 | F5                            | Switch camera view                             |
 
@@ -171,6 +171,13 @@ The room size of a window is its pixel size / 100 * `window_scale`. For
 sharper windows with more room for content at the same size in the room,
 raise `spawn_width`/`spawn_height` and lower `window_scale` by the same
 factor (e.g. 1920x1080 at 0.25 matches the default 960x540 at 0.5).
+
+### Input
+
+| Option        | Type          | Default | Description |
+| ---------------| ---------------| ---------| -------------|
+| typing_cursor | bool          | false   | window (typing) mode also frees the pointer: the view freezes, the crosshair hides and a cursor appears on the windows. It moves in each window's own pixels whatever the window's angle (click, drag-select and scroll as usual, with the client's own cursor image), crosses into any window it passes (focusing it), and past the room monitor's edge continues as the normal cursor on the other monitors |
+| typing_button | string/number | none    | a mouse button that toggles window mode: `side`, `extra`, `forward`, `back`, `task`, or a Linux button code |
 
 ### Player
 
