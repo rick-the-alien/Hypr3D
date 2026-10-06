@@ -1545,6 +1545,8 @@ void GLScene::drawCharacters(const Mat4& vp, float dt) {
                     for (int i = 0; i < C.model->animationCount(); ++i)
                         C.idle.push_back(i);
 
+                C.walkClip = C.model->animIndex(C.spec.walk);
+
                 C.model->setAnim(CPlayerModel::EState::Idle,
                                  pickIdle(C, -1));
             }
@@ -1553,14 +1555,33 @@ void GLScene::drawCharacters(const Mat4& vp, float dt) {
         if (!C.model || !C.model->loaded())
             continue;
 
-        C.model->setPose(C.spec.position, 0.f, C.spec.scale, Vec3{},
-                         C.spec.rotationDeg);
+        // Walking plays the walk clip (looping); otherwise random idles, a
+        // new one each time a clip ends.
+        const int CUR = C.model->currentClip();
+        if (C.walking && C.walkClip >= 0) {
+            if (CUR != C.walkClip)
+                C.model->crossfadeTo(C.walkClip);
+        } else if (CUR == C.walkClip && C.walkClip >= 0 &&
+                   !std::count(C.idle.begin(), C.idle.end(), C.walkClip))
+            C.model->crossfadeTo(pickIdle(C, CUR));
+        else if (C.model->loops() > 0)
+            C.model->crossfadeTo(pickIdle(C, CUR));
+
         C.model->setFlat(C.spec.flat);
         C.model->update(dt);
 
-        if (C.model->loops() > 0)
-            C.model->crossfadeTo(pickIdle(C, C.model->currentClip()));
+        // In place: whatever the clip's root moved horizontally is taken back
+        // off the placement (turned and scaled like the model), so the
+        // character stands -- or walks on the spot -- exactly at its feet.
+        C.root = C.model->rootMotion();
+        constexpr float DEG = 3.14159265f / 180.f;
+        const float YAW = C.spec.rotationDeg.y * DEG;
+        const float RX = C.root.x * C.spec.scale.x, RZ = C.root.z * C.spec.scale.z;
+        const Vec3 SHIFT{RX * std::cos(YAW) + RZ * std::sin(YAW), 0.f,
+                         -RX * std::sin(YAW) + RZ * std::cos(YAW)};
 
+        C.model->setPose(C.spec.position - SHIFT, 0.f, C.spec.scale, Vec3{},
+                         C.spec.rotationDeg);
         C.model->draw(vp, m_camera.position);
     }
 }

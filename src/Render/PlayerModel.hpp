@@ -173,6 +173,12 @@ class CPlayerModel {
         return m_loops;
     }
 
+    // Root motion: the horizontal (x/z) offset of the skeleton's root joint
+    // from its rest position at the current pose, in model space. Walk clips
+    // carry the character forward this way; a caller that moves the
+    // character itself subtracts it (in place) and advances by its change.
+    Vec3 rootMotion() const;
+
     // Advance the clock and evaluate the animation into the vertex buffers.
     void update(float dt);
 
@@ -280,6 +286,7 @@ class CPlayerModel {
     // Per skin: true = the mesh node's world goes before the palette (the
     // bind bakes it in), false = glTF spec (see load()).
     std::vector<bool>      m_skinMeshWorld;
+    Vec3                   m_rootRest{}; // root joint at rest, model space
     std::vector<SPrim>     m_prims;
 
     EState m_state      = EState::Idle;

@@ -343,6 +343,16 @@ void CPlayerModel::setAnim(EState state, int index) {
     m_animFor[static_cast<int>(state)] = index;
 }
 
+Vec3 CPlayerModel::rootMotion() const {
+    if (m_skins.empty() || m_skins[0].joints.empty())
+        return {};
+    const int R = m_skins[0].joints[0];
+    if (R < 0 || R >= static_cast<int>(m_world.size()))
+        return {};
+    return Vec3{m_world[R].m[12] - m_rootRest.x, 0.f,
+                m_world[R].m[14] - m_rootRest.z};
+}
+
 int CPlayerModel::animIndex(const std::string& name) const {
     for (int i = 0; i < static_cast<int>(m_anims.size()); ++i)
         if (m_anims[i].name == name)
@@ -1036,6 +1046,12 @@ bool CPlayerModel::load(const std::string& path) {
     // keep the mesh-world-first path. Applying the mesh world to a spec
     // export scaled every vertex by the armature twice and collapsed it onto
     // its joints (membranes stretched between the bones).
+    if (!m_skins.empty() && !m_skins[0].joints.empty()) {
+        const int R = m_skins[0].joints[0];
+        if (R >= 0 && R < static_cast<int>(m_world.size()))
+            m_rootRest = Vec3{m_world[R].m[12], m_world[R].m[13], m_world[R].m[14]};
+    }
+
     m_skinMeshWorld.assign(m_skins.size(), true);
     for (size_t s = 0; s < m_skins.size(); ++s) {
         const auto& SK = m_skins[s];

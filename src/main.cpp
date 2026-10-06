@@ -994,6 +994,13 @@ struct SCharState {
     float                   yawDeg = 0; // runtime facing (Y), degrees
     float                   radius = 0.3f, height = 1.8f;
     JPH::BodyID             body{};
+
+    // Walking a path (dropped onto one): the path index and the arc length
+    // along it. The character advances by its walk clip's own root motion.
+    int   path = -1;
+    float along = 0.f;
+    Vec3  lastRoot{};
+    float lastStep = 0.f;
 };
 static std::vector<SCharState> g_chars;
 static size_t                  g_charGrabIndex = SIZE_MAX;
@@ -1202,6 +1209,126 @@ static void removePathPoint(int p, int i) {
             g_activePath = -1;
         else if (g_activePath > p)
             --g_activePath;
+
+        // Walkers on it stop; walkers on later paths keep theirs.
+        for (auto& C : g_chars) {
+            if (C.path == p)
+                C.path = -1;
+            else if (C.path > p)
+                --C.path;
+        }
+    }
+}
+
+// A path as the drawn polyline (the same curve samples the ribbon uses)
+// with the arc length at every sample; closed, so the last sample is the
+// first again.
+struct SPathLine {
+    std::vector<Vec3>  pts;
+    std::vector<float> at; // arc length at pts[i]
+    float              total = 0.f;
+};
+
+static SPathLine pathLine(const SPath& path) {
+    constexpr int STEPS = 16;
+    SPathLine L;
+    const size_t N = path.points.size();
+    if (N < 2)
+        return L;
+
+    const GLScene::SPathView V{path.points, path.smooth};
+    for (size_t i = 0; i < N; ++i)
+        for (int k = 0; k < STEPS; ++k)
+            L.pts.push_back(GLScene::pathPoint(V, i, static_cast<float>(k) / STEPS));
+    L.pts.push_back(L.pts.front());
+
+    L.at.resize(L.pts.size(), 0.f);
+    for (size_t i = 1; i < L.pts.size(); ++i) {
+        const Vec3 D = L.pts[i] - L.pts[i - 1];
+        L.at[i] = L.at[i - 1] + std::sqrt(D.x * D.x + D.y * D.y + D.z * D.z);
+    }
+    L.total = L.at.back();
+    return L;
+}
+
+// Position and travel direction at arc length s (wrapped).
+static void pathAt(const SPathLine& L, float s, Vec3& pos, Vec3& dir) {
+    s = std::fmod(s, L.total);
+    if (s < 0.f)
+        s += L.total;
+    const size_t I = std::min<size_t>(
+        std::upper_bound(L.at.begin(), L.at.end(), s) - L.at.begin(),
+        L.pts.size() - 1);
+    const size_t A = I == 0 ? 0 : I - 1;
+    const float SEG = L.at[I] - L.at[A];
+    const float T = SEG > 1e-6f ? (s - L.at[A]) / SEG : 0.f;
+    pos = L.pts[A] + (L.pts[I] - L.pts[A]) * T;
+    dir = L.pts[I] - L.pts[A];
+}
+
+// Dropping a character within reach of a path puts it on that path at the
+// nearest point of the curve.
+static void attachToNearestPath(SCharState& c) {
+    constexpr float REACH = 0.6f;
+    float bestD = REACH * REACH;
+    c.path = -1;
+    for (size_t p = 0; p < g_paths.size(); ++p) {
+        const auto L = pathLine(g_paths[p]);
+        for (size_t i = 0; i + 1 < L.pts.size(); ++i) {
+            const Vec3 D = L.pts[i] - c.feet;
+            const float D2 = D.x * D.x + D.z * D.z;
+            if (D2 < bestD && std::fabs(D.y) < 0.8f) {
+                bestD   = D2;
+                c.path  = static_cast<int>(p);
+                c.along = L.at[i];
+            }
+        }
+    }
+    c.lastStep = 0.f;
+}
+
+// One frame of walking: advance by the walk clip's root motion since the
+// last frame (the distance the feet really covered), follow the curve, keep
+// the feet on its ground, and turn to face the way it goes.
+static void walkCharacter(size_t i, float dt) {
+    auto& C = g_chars[i];
+    const Vec3 ROOT = g_scene.characterRootMotion(i);
+
+    if (C.path < 0 || C.path >= static_cast<int>(g_paths.size())) {
+        C.path     = -1;
+        C.lastRoot = ROOT;
+        return;
+    }
+
+    const auto L = pathLine(g_paths[C.path]);
+    if (L.total < 1e-3f)
+        return;
+
+    // The root jumps back when the clip wraps; that frame keeps the last
+    // step. A clip without root motion still walks, slowly.
+    const Vec3 D = ROOT - C.lastRoot;
+    float step = std::sqrt(D.x * D.x + D.z * D.z) * C.cfg.scale.z;
+    if (step > 0.25f)
+        step = C.lastStep;
+    C.lastRoot = ROOT;
+    C.lastStep = step;
+    if (step <= 1e-5f && dt > 0.f)
+        step = 0.6f * dt;
+
+    C.along += step;
+
+    Vec3 pos, dir;
+    pathAt(L, C.along, pos, dir);
+    C.feet = pos;
+
+    if (dir.x * dir.x + dir.z * dir.z > 1e-8f) {
+        const float TARGET = std::atan2(dir.x, dir.z) * 180.f / 3.14159265f;
+        float dYaw = TARGET - C.yawDeg;
+        while (dYaw > 180.f)
+            dYaw -= 360.f;
+        while (dYaw < -180.f)
+            dYaw += 360.f;
+        C.yawDeg += dYaw * (1.0f - std::exp(-8.0f * dt));
     }
 }
 
@@ -2822,7 +2949,11 @@ static void resetPointerGesture() {
             g_sceneObjects[g_mapGrabIndex].dynamic ? LAYER_MOVING
                                                     : LAYER_STATIC);
     g_mapGrabIndex = SIZE_MAX;
-    g_charGrabIndex = SIZE_MAX; // the body rejoins the contacts next frame
+    // A dropped character walks the path it lands on (if any); the body
+    // rejoins the contacts next frame.
+    if (g_charGrabIndex < g_chars.size())
+        attachToNearestPath(g_chars[g_charGrabIndex]);
+    g_charGrabIndex = SIZE_MAX;
 }
 
 static void finishClientButton(uint32_t timeMs) {
@@ -3502,6 +3633,11 @@ static void update3D(float dt) {
 
     if (g_pointerGesture == EPointerGesture::CharDrag && g_pointerDown)
         carryCharacter(dt);
+    for (size_t i = 0; i < g_chars.size(); ++i) {
+        if (i != g_charGrabIndex && g_chars[i].path >= 0)
+            walkCharacter(i, dt);
+        g_scene.setCharacterWalking(i, i != g_charGrabIndex && g_chars[i].path >= 0);
+    }
     syncCharacterBodies();
     g_scene.setHud(g_tool, toolLabels());
     {
@@ -5269,6 +5405,7 @@ static void onMouseButton(
                 const Vec3 TO = FEET - CAM.position;
                 g_charGrabIndex = CHAR;
                 g_charGrabDist  = std::sqrt(TO.x * TO.x + TO.y * TO.y + TO.z * TO.z);
+                g_chars[CHAR].path = -1; // picked up: off its path
 
                 g_pointerGesture = EPointerGesture::CharDrag;
                 g_pointerButton  = BTN_LEFT;
@@ -6341,6 +6478,9 @@ static int luaConfig(lua_State* L) {
                                       C.name.c_str());
                 C.radius = std::max(0.05f, RADIUS);
                 C.height = std::max(0.1f, HEIGHT);
+                if (!SET_STRING(CIDX, "walk", C.walk, "characters.<name>.walk"))
+                    return luaL_error(L, "hypr3d.config: characters.%s.walk must be a clip name",
+                                      C.name.c_str());
 
                 if (!C.path.empty())
                     CHARS.push_back(std::move(C));
@@ -6371,6 +6511,8 @@ static int luaConfig(lua_State* L) {
                 if (SAME_PLACE) {
                     ST.feet   = OLD.feet;
                     ST.yawDeg = OLD.yawDeg;
+                    ST.path   = OLD.path;
+                    ST.along  = OLD.along;
                 }
                 // The body is rebuilt when its size changed.
                 if (OLD.radius == ST.radius && OLD.height == ST.height)
