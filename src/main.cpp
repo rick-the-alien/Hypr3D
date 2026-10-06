@@ -38,6 +38,7 @@
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/render/Texture.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
@@ -1136,6 +1137,7 @@ static bool captureWanted() {
 }
 
 static void vcMove(double dx, double dy);
+static void requestDeactivate3D();
 static void refreshCursorImage();
 static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
                               Vector2D& hotspot);
@@ -1268,6 +1270,20 @@ static void startFramePump() {
             [](SP<CEventLoopTimer> self, void*) {
                 if (!g_active) {
                     self->updateTimeout(std::nullopt);
+                    return;
+                }
+
+                // A session lock ends 3D at once. While locked Hyprland
+                // draws only the lock surfaces, so a fade would never finish,
+                // and a lock (with the monitor teardown that can follow) is no
+                // time to keep windows ghosted out of their layout. Back in, a
+                // toggle reopens it.
+                if (g_pSessionLockManager &&
+                    g_pSessionLockManager->isSessionLocked()) {
+                    g_transitionTarget = 0.0f;
+                    g_transition       = 0.0f;
+                    requestDeactivate3D();
+                    self->updateTimeout(kFramePumpInterval);
                     return;
                 }
 
