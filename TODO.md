@@ -36,6 +36,17 @@ Now that top/overlay layers draw over the room and take input, Quickshell
 can serve as a heads-up display inside 3D (status, room controls, mode
 indicator).
 
+## To test after the upstream merge (2026-10-06)
+
+- **Third-person view (F5) with the typing-mode cursor:** the cursor's
+  screen ray and projection use `g_scene.camera()` (the eye). If third
+  person renders from a different camera, cursor placement and clicks
+  will be off.
+- **Volumetric windows (`windows.depth`, default 0.05) with the typing
+  cursor:** the cursor is drawn on the window's centre plane and picking
+  uses the flat quad; on a thick slab it may sit slightly inside the
+  front face.
+
 ## Loose ends
 
 - **Natural scrolling:** scrolling a window under the typing-mode cursor
@@ -43,10 +54,9 @@ indicator).
   scroll factor.
 - **F3 while typing elsewhere:** F3 toggles the debug HUD even while typing
   into a window on another monitor in typing mode.
-- **Same-path reload:** only the Jolt statics were made safe for a reload of
-  the same `.so` path (the mapping is never unloaded, see `joltInit`). Other
-  statics may also carry over. Matters to anyone reloading via `hyprpm`;
-  `reload.sh` sidesteps it by loading a unique copy.
+- **Same-path reload:** largely solved by #5's `-fno-gnu-unique` (the
+  plugin is really unloaded now). `reload.sh` still loads a unique copy,
+  which is harmless; it could go back to a plain unload/load.
 - **Cursor sensitivity on small/far windows:** the typing-mode cursor moves
   1:1 in window pixels, which means big hand movements on a far-away or
   small window. A sensitivity option may be needed.
@@ -55,6 +65,16 @@ indicator).
 
 ## Upstream candidates (samine825/Hypr3D)
 
-- Open: #2 close crash, #3 spawn box monitor offset.
-- Could follow: the same-path reload fix (Jolt statics), keeping
-  monitor-sized bottom layers (wallpapers) out of the room.
+- Merged: #1 multi-monitor, #2 close crash, #3 spawn box monitor offset.
+  #5 (AfrobamaYT: unload/reload crashes, async model loading, JPEG
+  textures) is merged into `rick` but still open upstream.
+- Planned PRs:
+  - **Typing mode** (free cursor, the cursor on windows, client cursor
+    images): on the existing Super + Left Alt keyboard-mode toggle,
+    enabled by a config option, with the extra toggle button (BTN_BACK)
+    assignable in config.
+  - **Quickshell/layer integration:** draw the room under the top and
+    overlay layers and hand them pointer and keyboard input, as a config
+    choice of which layer the room is drawn under.
+- Could follow: keeping monitor-sized bottom layers (wallpapers) out of
+  the room, `hl.plugin.hypr3d.active()`.
