@@ -1068,6 +1068,56 @@ static void carryCharacter(float dt) {
     damageCurrentMonitor();
 }
 
+// --- tools (keys 1-5) ---------------------------------------------------------
+//
+// Weapon-style tool slots in moving mode, shown on the HUD slot bar:
+//   1 pointer (default) -- the crosshair as before
+//   2 curve -- left-click drops a point on the ground under the crosshair,
+//              right-click removes the last one; the path closes itself and
+//              is drawn as a smooth curve through the points (Catmull-Rom)
+//   3 lines -- the same path drawn as straight segments
+//   4, 5    -- free
+// One path for now, in plugin memory; meant for characters to walk.
+
+enum class ETool : int { Pointer = 1, Curve = 2, Lines = 3 };
+
+static int               g_tool = static_cast<int>(ETool::Pointer);
+static std::vector<Vec3> g_pathPoints;
+static bool              g_pathSmooth = true;
+
+static bool pathTool() {
+    return g_tool == static_cast<int>(ETool::Curve) ||
+        g_tool == static_cast<int>(ETool::Lines);
+}
+
+static const std::vector<std::string>& toolLabels() {
+    static const std::vector<std::string> LABELS = {"POINTER", "CURVE", "LINES", "", ""};
+    return LABELS;
+}
+
+// A path point on the ground under the crosshair: the nearest collidable
+// surface (or the grid platform) the centre ray hits, dropped onto the
+// ground below it -- aiming at a wall puts the point at its foot.
+static bool groundUnderCrosshair(Vec3& out) {
+    const auto& CAM = g_scene.camera();
+    const Vec3 DIR = CAM.centerRay();
+
+    float t = -1.f;
+    if (const auto HIT = modelRayHit(CAM.position, DIR, false); HIT.hit)
+        t = HIT.dist;
+    if (g_cfgGrid && DIR.y < -1e-4f) {
+        const float TG = (Camera::kFloorY - CAM.position.y) / DIR.y;
+        if (TG > 0.f && (t < 0.f || TG < t))
+            t = TG;
+    }
+    if (t <= 0.f)
+        return false;
+
+    const Vec3 P = CAM.position + DIR * (t - 0.02f); // just in front of it
+    out = Vec3{P.x, groundBelow(Vec3{P.x, P.y + 0.05f, P.z}, P.y), P.z};
+    return true;
+}
+
 static bool modelInFront(const Vec3& origin, const Vec3& dir,
                          const World3D::SHit& windowHit) {
     const auto MR = modelRayHit(origin, dir, /*dynamicOnly=*/false);
@@ -3168,6 +3218,8 @@ static void update3D(float dt) {
     if (g_pointerGesture == EPointerGesture::CharDrag && g_pointerDown)
         carryCharacter(dt);
     syncCharacterBodies();
+    g_scene.setHud(g_tool, toolLabels());
+    g_scene.setPath(g_pathPoints, g_pathSmooth, pathTool());
     for (size_t i = 0; i < g_chars.size(); ++i)
         g_scene.setCharacterPose(
             i, g_chars[i].feet,
@@ -4114,6 +4166,24 @@ static void onMouseButton(
         return;
     }
 
+    // Path tools: left-click adds a point on the ground under the
+    // crosshair, right-click removes the last one. Never reaches a client.
+    if (pathTool() && !g_superHeld &&
+        (event.button == BTN_LEFT || event.button == BTN_RIGHT)) {
+        if (PRESSED) {
+            if (event.button == BTN_LEFT) {
+                Vec3 P;
+                if (groundUnderCrosshair(P))
+                    g_pathPoints.push_back(P);
+            } else if (!g_pathPoints.empty())
+                g_pathPoints.pop_back();
+            g_swallowRelease = event.button;
+            damageCurrentMonitor();
+        }
+        info.cancelled = true;
+        return;
+    }
+
     // Super + wheel-press: grab the aimed window's roll around its normal.
     // Sweeping the crosshair around the window center then rotates the
     // window by the swept angle; release ends it. Never reaches the client.
@@ -4548,6 +4618,20 @@ static void onKeyboardKey(
     // Window mode: every key reaches the focused window untouched.
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
+
+    // 1-5 pick a tool (Super + digit stays the compositor's).
+    if (!g_superHeld && SYM >= XKB_KEY_1 && SYM <= XKB_KEY_5) {
+        if (PRESSED) {
+            g_tool = static_cast<int>(SYM - XKB_KEY_0);
+            if (g_tool == static_cast<int>(ETool::Curve))
+                g_pathSmooth = true;
+            else if (g_tool == static_cast<int>(ETool::Lines))
+                g_pathSmooth = false;
+            damageCurrentMonitor();
+        }
+        info.cancelled = true;
+        return;
+    }
 
     // F5: cycle the view -- first person, third person behind, third
     // person in front.

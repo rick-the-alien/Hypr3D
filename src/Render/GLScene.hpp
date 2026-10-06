@@ -173,6 +173,22 @@ class GLScene {
 
     void setCharacters(const std::vector<SCharacterSpec>& specs);
 
+    // --- tools: HUD slot bar and the drawn path -----------------------------
+    // The slot bar (keys 1-5) at the bottom of the room view; `active` is
+    // 1-based, labels may be empty for unused slots.
+    void setHud(int active, const std::vector<std::string>& labels) {
+        m_hudActive = active;
+        m_hudLabels = labels;
+    }
+
+    // A closed path on the ground: a smooth curve through the points
+    // (Catmull-Rom) or straight segments. `editing` also marks the points.
+    void setPath(const std::vector<Vec3>& points, bool smooth, bool editing) {
+        m_pathPoints  = points;
+        m_pathSmooth  = smooth;
+        m_pathEditing = editing;
+    }
+
     // Runtime placement of character i (in setCharacters order): carrying
     // moves a character without touching its config.
     void setCharacterPose(size_t i, const Vec3& position, const Vec3& rotationDeg) {
@@ -252,6 +268,8 @@ class GLScene {
     void refreshPlayer();
 
     void drawDebugOverlay(int width, int height);
+    void drawHud(int width, int height);
+    void drawPath(const Mat4& vp);
 
     void destroyGLObjects();
 
@@ -383,6 +401,13 @@ class GLScene {
     float                           m_debugFps     = 0.f;
 
     unsigned int                    m_textVAO = 0, m_textVBO = 0;
+    unsigned int                    m_pathVAO = 0, m_pathVBO = 0;
+
+    int                             m_hudActive = 1;
+    std::vector<std::string>        m_hudLabels;
+    std::vector<Vec3>               m_pathPoints;
+    bool                            m_pathSmooth  = true;
+    bool                            m_pathEditing = false;
 
     // Scene slots: one per config object, index-aligned with the specs.
     struct SSlot {

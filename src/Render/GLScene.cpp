@@ -2045,6 +2045,230 @@ const unsigned char* GLScene::probeRGBA() const {
 
     // F3 HUD text: a streaming quad per set font bit, screen-space ortho.
 // font8x8 is public domain (daniel hepper / marcel sondaar).
+// The drawn path: a thin ribbon lying on the ground along the closed curve
+// (Catmull-Rom through the points, or straight segments), plus a marker on
+// every point while it is being edited. World space, depth-tested, so walls
+// hide it like everything else.
+void GLScene::drawPath(const Mat4& vp) {
+    const size_t N = m_pathPoints.size();
+    if (N == 0)
+        return;
+
+    std::vector<Vec3> line;
+    if (N >= 3 && m_pathSmooth) {
+        constexpr int STEPS = 16;
+        for (size_t i = 0; i < N; ++i) {
+            const Vec3& P0 = m_pathPoints[(i + N - 1) % N];
+            const Vec3& P1 = m_pathPoints[i];
+            const Vec3& P2 = m_pathPoints[(i + 1) % N];
+            const Vec3& P3 = m_pathPoints[(i + 2) % N];
+            for (int k = 0; k < STEPS; ++k) {
+                const float T = static_cast<float>(k) / STEPS;
+                const float T2 = T * T, T3 = T2 * T;
+                line.push_back((P1 * 2.0f + (P2 - P0) * T +
+                                (P0 * 2.0f - P1 * 5.0f + P2 * 4.0f - P3) * T2 +
+                                (P1 * 3.0f - P0 - P2 * 3.0f + P3) * T3) *
+                               0.5f);
+            }
+        }
+    } else
+        line = m_pathPoints;
+    if (line.size() >= 2)
+        line.push_back(line.front()); // closed
+
+    constexpr float LIFT = 0.03f; // above the floor it lies on
+    constexpr float HALF = 0.03f; // ribbon half width
+    constexpr float MARK = 0.12f; // marker half size
+
+    std::vector<float> verts;
+    const auto TRI = [&](const Vec3& a, const Vec3& b, const Vec3& c) {
+        for (const Vec3* P : {&a, &b, &c})
+            verts.insert(verts.end(), {P->x, P->y + LIFT, P->z, 0.f, 0.f});
+    };
+
+    for (size_t i = 0; i + 1 < line.size(); ++i) {
+        const Vec3& A = line[i];
+        const Vec3& B = line[i + 1];
+        const float DX = B.x - A.x, DZ = B.z - A.z;
+        const float LEN = std::sqrt(DX * DX + DZ * DZ);
+        if (LEN < 1e-4f)
+            continue;
+        const Vec3 SIDE{-DZ / LEN * HALF, 0.f, DX / LEN * HALF};
+        TRI(A - SIDE, A + SIDE, B + SIDE);
+        TRI(A - SIDE, B + SIDE, B - SIDE);
+    }
+    const size_t RIBBON = verts.size() / 5;
+
+    // Diamonds on the points; the first one (where the loop closes) is drawn
+    // in its own colour.
+    size_t firstMark = 0;
+    if (m_pathEditing) {
+        for (size_t i = 0; i < N; ++i) {
+            if (i == 1)
+                firstMark = verts.size() / 5;
+            const Vec3& C = m_pathPoints[i];
+            const Vec3 X{MARK, 0.f, 0.f}, Z{0.f, 0.f, MARK};
+            TRI(C - X, C - Z, C + X);
+            TRI(C - X, C + X, C + Z);
+        }
+        if (N == 1)
+            firstMark = verts.size() / 5;
+    }
+    const size_t TOTAL = verts.size() / 5;
+    if (TOTAL == 0)
+        return;
+
+    if (!m_pathVAO) {
+        glGenVertexArrays(1, &m_pathVAO);
+        glGenBuffers(1, &m_pathVBO);
+        glBindVertexArray(m_pathVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_pathVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+
+    glBindVertexArray(m_pathVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pathVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                 verts.data(), GL_DYNAMIC_DRAW);
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+
+    if (RIBBON) {
+        glUniform4f(m_sceneColorUniform, 0.25f, 0.85f, 1.0f, 0.9f);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(RIBBON));
+    }
+    if (m_pathEditing && TOTAL > RIBBON) {
+        glUniform4f(m_sceneColorUniform, 0.3f, 1.0f, 0.4f, 1.0f); // start
+        glDrawArrays(GL_TRIANGLES, static_cast<GLint>(RIBBON),
+                     static_cast<GLint>(firstMark - RIBBON));
+        if (TOTAL > firstMark) {
+            glUniform4f(m_sceneColorUniform, 1.0f, 1.0f, 1.0f, 1.0f);
+            glDrawArrays(GL_TRIANGLES, static_cast<GLint>(firstMark),
+                         static_cast<GLint>(TOTAL - firstMark));
+        }
+    }
+
+    glDepthMask(GL_TRUE);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// The tool slot bar (keys 1-5): five boxes centred at the bottom of the room
+// view, raised clear of a desktop bar, the active one highlighted.
+void GLScene::drawHud(int width, int height) {
+    if (m_hudLabels.empty())
+        return;
+
+    GLint oldFBO = 0, oldViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldFBO);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_sceneFBO);
+    glViewport(0, 0, width, height);
+
+    constexpr float SLOT_W = 190.f, SLOT_H = 44.f, GAP = 10.f;
+    constexpr float BOTTOM = 120.f; // above a bottom bar
+    constexpr float SCALE = 2.f, GLYPH = 8.f;
+
+    const size_t SLOTS = m_hudLabels.size();
+    const float TOTAL_W = SLOTS * SLOT_W + (SLOTS - 1) * GAP;
+    const float X0 = (width - TOTAL_W) * 0.5f;
+    const float Y0 = height - BOTTOM - SLOT_H;
+
+    std::vector<float> boxes, active, text;
+    const auto QUAD = [](std::vector<float>& v, float l, float t, float r, float b) {
+        v.insert(v.end(), {
+            l, t, 0, 0, 0,  r, t, 0, 0, 0,  l, b, 0, 0, 0,
+            l, b, 0, 0, 0,  r, t, 0, 0, 0,  r, b, 0, 0, 0,
+        });
+    };
+
+    for (size_t i = 0; i < SLOTS; ++i) {
+        const float L = X0 + i * (SLOT_W + GAP);
+        const bool ACTIVE = static_cast<int>(i) + 1 == m_hudActive;
+        QUAD(ACTIVE ? active : boxes, L, Y0, L + SLOT_W, Y0 + SLOT_H);
+
+        const std::string LABEL = std::to_string(i + 1) +
+            (m_hudLabels[i].empty() ? "" : " " + m_hudLabels[i]);
+        float cx = L + 10.f;
+        const float CY = Y0 + (SLOT_H - GLYPH * SCALE) * 0.5f;
+        for (const char CH : LABEL) {
+            const auto ROWS = font8x8_basic[static_cast<unsigned char>(CH)];
+            for (int row = 0; row < 8; ++row)
+                for (int col = 0; col < 8; ++col)
+                    if (ROWS[row] & (1u << col))
+                        QUAD(text, cx + col * SCALE, CY + row * SCALE,
+                             cx + col * SCALE + SCALE, CY + row * SCALE + SCALE);
+            cx += GLYPH * SCALE;
+        }
+    }
+
+    if (!m_textVAO) {
+        glGenVertexArrays(1, &m_textVAO);
+        glGenBuffers(1, &m_textVBO);
+        glBindVertexArray(m_textVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+    glBindVertexArray(m_textVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
+
+    const Mat4 ORTHO = Mat4::translation(Vec3{-1.f, 1.f, 0.f}) *
+        Mat4::scale(Vec3{2.0f / width, -2.0f / height, 1.0f});
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, ORTHO.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glDisable(GL_CULL_FACE);
+
+    const auto DRAW = [&](const std::vector<float>& v, float r, float g,
+                          float b, float a) {
+        if (v.empty())
+            return;
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(v.size() * sizeof(float)),
+                     v.data(), GL_DYNAMIC_DRAW);
+        glUniform4f(m_sceneColorUniform, r, g, b, a);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(v.size() / 5));
+    };
+
+    DRAW(boxes, 0.05f, 0.05f, 0.08f, 0.55f);
+    DRAW(active, 0.15f, 0.55f, 0.75f, 0.75f);
+    DRAW(text, 1.f, 1.f, 1.f, 1.f);
+
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(oldFBO));
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+}
+
 void GLScene::drawDebugOverlay(int width, int height) {
     if (!m_debugOverlay)
         return;
@@ -2323,6 +2547,7 @@ bool GLScene::render(
     }
 
     drawCharacters(vp, dt);
+    drawPath(vp);
 
     if (m_gridVisible) {
         drawFloor(vp);
@@ -2345,6 +2570,7 @@ bool GLScene::render(
 
     // F3 HUD: always on top of the scene, never part of the 3D pass state.
     drawDebugOverlay(width, height);
+    drawHud(width, height);
 
     // Read back one pixel of the offscreen scene while it is still bound. A
     // floor point in the lower half of the screen, where ground and sky are
@@ -2541,6 +2767,14 @@ void GLScene::destroyGLObjects() {
     if (m_textVAO) {
         glDeleteVertexArrays(1, &m_textVAO);
         m_textVAO = 0;
+    }
+    if (m_pathVBO) {
+        glDeleteBuffers(1, &m_pathVBO);
+        m_pathVBO = 0;
+    }
+    if (m_pathVAO) {
+        glDeleteVertexArrays(1, &m_pathVAO);
+        m_pathVAO = 0;
     }
     if (m_crosshairVBO) {
         glDeleteBuffers(1, &m_crosshairVBO);
