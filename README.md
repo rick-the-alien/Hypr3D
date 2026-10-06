@@ -214,6 +214,36 @@ factor (e.g. 1920x1080 at 0.25 matches the default 960x540 at 0.5).
 Want only part of a model to be solid? Rename those nodes in Blender to
 start with `nocol` -- they'll still render, but you'll walk right through.
 
+### <a name="characters"></a> Characters
+
+`characters = { name = { ... }, ... }`: animated (skinned) glTF models that
+play their clips in place. Each time a clip ends, one of the `idle` clips is
+picked at random (never the same one twice in a row when there's a choice) and
+crossfaded in. Each stands in an upright, flat-bottomed collision cylinder on
+its feet position; Super + left-drag carries it (it stays upright, keeps
+animating, faces you, and its feet follow the ground under the crosshair).
+
+| Option    | Type                         | Default  | Description                                   |
+| -----------| ------------------------------| ----------| -----------------------------------------------|
+| path      | string                       | ""       | the model file (.glb/.gltf) with its animations |
+| transform | [transform](#transform)      |          | position of the feet, rotation, scale         |
+| flat      | bool                         | false    | raw texture, no headlight shading             |
+| idle      | list of strings              | all      | clip names to pick between                    |
+| radius    | float                        | 0.3      | collision cylinder radius (m)                 |
+| height    | float                        | 1.8      | collision cylinder height (m)                 |
+
+Mixamo exports the character and each animation as separate FBX files.
+`tools/mixamo2glb.py` merges them into one `.glb` with a named animation per
+clip (Blender 4.4+):
+
+```sh
+blender -b -P tools/mixamo2glb.py -- path/to/mixamo-folder out.glb
+```
+
+The folder holds `character.fbx` plus the animation FBXs (or a
+`character.json` listing them); each clip is named after its file
+(`idle.alt1.fbx` → `idle.alt1`).
+
 ### <a name="mesh"></a> Mesh
 
 | Option         | Type                    | Default   | Description                         |

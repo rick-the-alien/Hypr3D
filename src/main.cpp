@@ -14,6 +14,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/CylinderShape.h>
 #include <Jolt/Physics/Collision/Shape/PlaneShape.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
@@ -149,7 +150,8 @@ enum class EPointerGesture : uint8_t {
     Move3D,
     ResizeReal,
     WheelRoll,
-    MapDrag // carrying a dynamic (static = false) scene object
+    MapDrag, // carrying a dynamic (static = false) scene object
+    CharDrag // carrying a character
 };
 
 static bool            g_pointerDown = false;
@@ -974,6 +976,163 @@ static SModelRayHit modelRayHit(const Vec3& origin, const Vec3& dir,
 
 // A model is IN FRONT of the aimed window when its ray hit is closer (or
 // there is no window hit at all).
+// --- characters: placement, collision, carrying ------------------------------
+//
+// Each character (config: characters = { ... }) stands on its feet position
+// with an upright Jolt cylinder around it: a flat bottom on the floor it was
+// placed on, kinematic, so it blocks the player but never tumbles. Super +
+// left-drag carries it: it stays upright, turns to face the player, and its
+// feet follow the ground under the crosshair. The runtime placement survives
+// config reloads unless the config's own position/rotation changed (the same
+// rule as carried scene objects).
+
+static void damageCurrentMonitor();
+
+struct SCharState {
+    GLScene::SCharacterSpec cfg;        // as parsed: the file's truth
+    Vec3                    feet{};     // runtime placement
+    float                   yawDeg = 0; // runtime facing (Y), degrees
+    float                   radius = 0.3f, height = 1.8f;
+    JPH::BodyID             body{};
+};
+static std::vector<SCharState> g_chars;
+static size_t                  g_charGrabIndex = SIZE_MAX;
+static float                   g_charGrabDist  = 0.0f;
+
+// Ground height under a point: the nearest collidable scene geometry below
+// it, else the grid platform (world zero), else `fallback`.
+static float groundBelow(const Vec3& p, float fallback) {
+    const Vec3 FROM{p.x, p.y + 0.5f, p.z};
+    const auto HIT = modelRayHit(FROM, Vec3{0.f, -1.f, 0.f}, false);
+    if (HIT.hit)
+        return FROM.y - HIT.dist;
+    return g_cfgGrid ? Camera::kFloorY : fallback;
+}
+
+// Nearest positive hit of a ray on an upright cylinder standing on `feet`
+// (sides and both caps), or -1.
+static float rayUprightCylinder(const Vec3& o, const Vec3& d, const Vec3& feet,
+                                float r, float h) {
+    float best = -1.f;
+    const auto KEEP = [&](float t) {
+        if (t > 0.f && (best < 0.f || t < best))
+            best = t;
+    };
+
+    const float OX = o.x - feet.x, OZ = o.z - feet.z;
+    const float A = d.x * d.x + d.z * d.z;
+    if (A > 1e-8f) {
+        const float B = 2.f * (OX * d.x + OZ * d.z);
+        const float C = OX * OX + OZ * OZ - r * r;
+        const float DISC = B * B - 4.f * A * C;
+        if (DISC >= 0.f) {
+            const float SQ = std::sqrt(DISC);
+            for (const float T : {(-B - SQ) / (2.f * A), (-B + SQ) / (2.f * A)}) {
+                const float Y = o.y + d.y * T;
+                if (Y >= feet.y && Y <= feet.y + h)
+                    KEEP(T);
+            }
+        }
+    }
+
+    if (std::fabs(d.y) > 1e-8f) {
+        for (const float CAP : {feet.y, feet.y + h}) {
+            const float T = (CAP - o.y) / d.y;
+            const float X = o.x + d.x * T - feet.x;
+            const float Z = o.z + d.z * T - feet.z;
+            if (X * X + Z * Z <= r * r)
+                KEEP(T);
+        }
+    }
+
+    return best;
+}
+
+static void destroyCharBody(SCharState& c) {
+    if (g_bodyIf && !c.body.IsInvalid()) {
+        g_bodyIf->RemoveBody(c.body);
+        g_bodyIf->DestroyBody(c.body);
+    }
+    c.body = {};
+}
+
+// Creates missing character bodies and keeps every body on its character.
+static void syncCharacterBodies() {
+    if (!g_joltSystem || !g_bodyIf)
+        return;
+
+    for (size_t i = 0; i < g_chars.size(); ++i) {
+        auto& C = g_chars[i];
+        const float HALF = C.height * 0.5f;
+        const JPH::RVec3 CENTER(C.feet.x, C.feet.y + HALF, C.feet.z);
+        const JPH::Quat ROT = JPH::Quat::sRotation(
+            JPH::Vec3::sAxisY(), C.yawDeg * 3.14159265f / 180.f);
+
+        if (C.body.IsInvalid()) {
+            JPH::CylinderShapeSettings SHAPE(HALF, C.radius);
+            auto RES = SHAPE.Create();
+            if (RES.HasError())
+                continue;
+
+            JPH::BodyCreationSettings BCS(RES.Get(), CENTER, ROT,
+                                          JPH::EMotionType::Kinematic,
+                                          LAYER_MOVING);
+            if (auto* B = g_bodyIf->CreateBody(BCS)) {
+                g_bodyIf->AddBody(B->GetID(), JPH::EActivation::Activate);
+                C.body = B->GetID();
+            }
+            continue;
+        }
+
+        g_bodyIf->SetObjectLayer(C.body, i == g_charGrabIndex ? LAYER_GRABBED
+                                                              : LAYER_MOVING);
+        g_bodyIf->SetPositionAndRotationWhenChanged(C.body, CENTER, ROT,
+                                                    JPH::EActivation::DontActivate);
+    }
+}
+
+// The character under a ray and its distance, or SIZE_MAX.
+static size_t pickCharacter(const Vec3& o, const Vec3& d, float& dist) {
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < g_chars.size(); ++i) {
+        const auto& C = g_chars[i];
+        const float T = rayUprightCylinder(o, d, C.feet, C.radius, C.height);
+        if (T > 0.f && (best == SIZE_MAX || T < dist)) {
+            best = i;
+            dist = T;
+        }
+    }
+    return best;
+}
+
+// Carrying: the character's feet follow the ground under the crosshair at
+// the pickup distance, and it turns (yaw only) to face the player.
+static void carryCharacter(float dt) {
+    if (g_charGrabIndex >= g_chars.size())
+        return;
+
+    auto& C = g_chars[g_charGrabIndex];
+    const auto& CAM = g_scene.camera();
+    const Vec3 TARGET = CAM.position + CAM.centerRay() * g_charGrabDist;
+
+    // Probe from above whichever is higher, the target or the eye: looking
+    // down at the floor nearby puts the target below it.
+    const Vec3 PROBE{TARGET.x, std::max(TARGET.y, CAM.position.y), TARGET.z};
+    C.feet = Vec3{TARGET.x, groundBelow(PROBE, C.feet.y), TARGET.z};
+
+    const float TARGET_YAW =
+        std::atan2(CAM.position.x - C.feet.x, CAM.position.z - C.feet.z) *
+        180.f / 3.14159265f;
+    float dYaw = TARGET_YAW - C.yawDeg;
+    while (dYaw > 180.f)
+        dYaw -= 360.f;
+    while (dYaw < -180.f)
+        dYaw += 360.f;
+    C.yawDeg += dYaw * (1.0f - std::exp(-10.0f * dt));
+
+    damageCurrentMonitor();
+}
+
 static bool modelInFront(const Vec3& origin, const Vec3& dir,
                          const World3D::SHit& windowHit) {
     const auto MR = modelRayHit(origin, dir, /*dynamicOnly=*/false);
@@ -2568,6 +2727,7 @@ static void resetPointerGesture() {
             g_sceneObjects[g_mapGrabIndex].dynamic ? LAYER_MOVING
                                                     : LAYER_STATIC);
     g_mapGrabIndex = SIZE_MAX;
+    g_charGrabIndex = SIZE_MAX; // the body rejoins the contacts next frame
 }
 
 static void finishClientButton(uint32_t timeMs) {
@@ -3244,6 +3404,15 @@ static void update3D(float dt) {
     // ---- player physics body: input -> velocity, Jolt owns the pose ----
     ensurePlayerBody();
     syncFloorBody();
+
+    if (g_pointerGesture == EPointerGesture::CharDrag && g_pointerDown)
+        carryCharacter(dt);
+    syncCharacterBodies();
+    for (size_t i = 0; i < g_chars.size(); ++i)
+        g_scene.setCharacterPose(
+            i, g_chars[i].feet,
+            Vec3{g_chars[i].cfg.rotationDeg.x, g_chars[i].yawDeg,
+                 g_chars[i].cfg.rotationDeg.z});
 
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
@@ -4949,6 +5118,27 @@ static void onMouseButton(
             if (bestIdx != SIZE_MAX && HIT.hit && bestT >= HIT.distance)
                 bestIdx = SIZE_MAX;
 
+            // A character closer than the aimed window and any model is
+            // picked up instead (upright, feet on the ground).
+            float charT = 0.f;
+            const size_t CHAR = pickCharacter(CAM.position, DIR, charT);
+            if (CHAR != SIZE_MAX && (!HIT.hit || charT < HIT.distance) &&
+                (bestIdx == SIZE_MAX || charT < bestT)) {
+                const auto& FEET = g_chars[CHAR].feet;
+                const Vec3 TO = FEET - CAM.position;
+                g_charGrabIndex = CHAR;
+                g_charGrabDist  = std::sqrt(TO.x * TO.x + TO.y * TO.y + TO.z * TO.z);
+
+                g_pointerGesture = EPointerGesture::CharDrag;
+                g_pointerButton  = BTN_LEFT;
+                g_pointerDown    = true;
+                g_resize         = {};
+
+                info.cancelled = true;
+                damageCurrentMonitor();
+                return;
+            }
+
             if (bestIdx != SIZE_MAX) {
                 const auto* MODEL = g_scene.sceneModel(bestIdx);
 
@@ -5988,12 +6178,55 @@ static int luaConfig(lua_State* L) {
                                       C.name.c_str());
                 lua_pop(L, 1);
 
+                float RADIUS = 0.3f, HEIGHT = 1.8f;
+                if (!SET_NUM(CIDX, "radius", RADIUS, "characters.<name>.radius") ||
+                    !SET_NUM(CIDX, "height", HEIGHT, "characters.<name>.height"))
+                    return luaL_error(L, "hypr3d.config: characters.%s: radius and height must be numbers",
+                                      C.name.c_str());
+                C.radius = std::max(0.05f, RADIUS);
+                C.height = std::max(0.1f, HEIGHT);
+
                 if (!C.path.empty())
                     CHARS.push_back(std::move(C));
                 lua_pop(L, 1); // the value; the key stays for lua_next
             }
             lua_pop(L, 1); // the section
         }
+
+        // Reconcile with the running characters by name: a character keeps
+        // where it was carried to unless its config placement changed.
+        std::vector<SCharState> NEXT;
+        for (const auto& SPEC : CHARS) {
+            SCharState ST;
+            ST.cfg    = SPEC;
+            ST.feet   = SPEC.position;
+            ST.yawDeg = SPEC.rotationDeg.y;
+            ST.radius = SPEC.radius;
+            ST.height = SPEC.height;
+
+            for (auto& OLD : g_chars) {
+                if (OLD.cfg.name != SPEC.name)
+                    continue;
+                const bool SAME_PLACE =
+                    OLD.cfg.position.x == SPEC.position.x &&
+                    OLD.cfg.position.y == SPEC.position.y &&
+                    OLD.cfg.position.z == SPEC.position.z &&
+                    OLD.cfg.rotationDeg.y == SPEC.rotationDeg.y;
+                if (SAME_PLACE) {
+                    ST.feet   = OLD.feet;
+                    ST.yawDeg = OLD.yawDeg;
+                }
+                // The body is rebuilt when its size changed.
+                if (OLD.radius == ST.radius && OLD.height == ST.height)
+                    std::swap(ST.body, OLD.body);
+                break;
+            }
+            NEXT.push_back(std::move(ST));
+        }
+        for (auto& OLD : g_chars)
+            destroyCharBody(OLD);
+        g_chars = std::move(NEXT);
+        g_charGrabIndex = SIZE_MAX; // indices may have shifted
 
         g_scene.setCharacters(CHARS);
     }
@@ -6228,6 +6461,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_playerBody = {};
     g_floorBody  = {};
     g_joltBodies.clear();
+    for (auto& C : g_chars)
+        C.body = {}; // died with the system
 
     g_active = false;
     stopFramePump();
