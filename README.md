@@ -215,6 +215,8 @@ animating, faces you, and its feet follow the ground under the crosshair).
 | idle      | list of strings              | all      | clip names to pick between                    |
 | radius    | float                        | 0.3      | collision cylinder radius (m)                 |
 | height    | float                        | 1.8      | collision cylinder height (m)                 |
+| walk      | string                       | "walk"   | clip played while walking a path              |
+| run       | string                       | "run"    | clip played while running a path              |
 
 Mixamo exports the character and each animation as separate FBX files.
 `tools/mixamo2glb.py` merges them into one `.glb` with a named animation per
@@ -227,6 +229,29 @@ blender -b -P tools/mixamo2glb.py -- path/to/mixamo-folder out.glb
 The folder holds `character.fbx` plus the animation FBXs (or a
 `character.json` listing them); each clip is named after its file
 (`idle.alt1.fbx` → `idle.alt1`).
+
+### <a name="tools"></a> Tools and paths
+
+With `world.tools = true`, keys **1-5** (in movement mode; Super + digit is left
+to the compositor) pick a tool, shown on a slot bar at the bottom of the view:
+
+| Key | Tool    | Use |
+| ----| --------| ----|
+| 1   | pointer | the crosshair, as without tools (default) |
+| 2   | curve   | left-click drops a **smooth** point (a circle) on the ground under the crosshair |
+| 3   | lines   | left-click drops a **sharp** point (a square): a corner |
+
+- **Paths close themselves:** new points go after the end (orange ring), just before the start (green ring and a chevron showing the direction).
+- **Mixing:** the curve bends through smooth points and turns sharp at square ones, so one path can mix curves and straight runs.
+- **Clicking an existing point** converts it to the tool's type, and makes its path the one new points go to.
+- **Right-click** deletes the point under the crosshair, else the active path's last one. A path without points is gone.
+- **Pressing the active tool's key again** starts a new path. The slot reads `NEW` until the first point, then `P<n>`.
+- **Lifetime:** paths live in plugin memory until a reload.
+
+**Walking.** Super + left-drag a character and drop it within 0.6 m of a path. It walks the path in a loop, in the path's direction, playing its `walk` clip, following the drawn curve with its feet on the ground and turning to face the way it goes.
+- **Speed:** it advances by the clip's own root motion, so the stride matches the travel.
+- **Running:** double left-click it to switch between walking and running (`run` clip).
+- **Stopping:** picking it up takes it off the path.
 
 ### <a name="mesh"></a> Mesh
 
