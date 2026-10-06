@@ -155,7 +155,7 @@ Everything is optional -- only set what you want to change.
 | panorama | string | ""      | 360° background image (equirectangular) |
 | grid     | bool   | true    | the starting 40x40 platform             |
 | monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
-| tools    | bool   | false   | tool slots on keys 1-5 with a HUD bar: 1 pointer, 2 curve and 3 lines draw closed paths on the ground (left-click adds a point, right-click removes one, clicking a point converts it, pressing the tool's key again starts a new path); a character dropped onto a path walks it |
+| tools    | bool   | false   | tool slots on keys 1-5 with a HUD bar: 1 cursor (default, no HUD), 2 curve and 3 lines draw closed paths on the ground (left-click adds a point, right-click removes one, clicking a point converts it, pressing the tool's key again starts a new path); a character dropped onto a path walks it |
 
 ### Windows
 
@@ -233,11 +233,13 @@ The folder holds `character.fbx` plus the animation FBXs (or a
 ### <a name="tools"></a> Tools and paths
 
 With `world.tools = true`, keys **1-5** (in movement mode; Super + digit is left
-to the compositor) pick a tool, shown on a slot bar at the bottom of the view:
+to the compositor) pick a tool. The slot bar at the bottom of the view shows
+only while a path tool is out, and paths show only then -- or while carrying a
+character, so you can see where to drop it:
 
 | Key | Tool    | Use |
 | ----| --------| ----|
-| 1   | pointer | the crosshair, as without tools (default) |
+| 1   | cursor  | the default: the crosshair, no HUD, paths hidden |
 | 2   | curve   | left-click drops a **smooth** point (a circle) on the ground under the crosshair |
 | 3   | lines   | left-click drops a **sharp** point (a square): a corner |
 
