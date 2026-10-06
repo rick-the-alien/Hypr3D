@@ -169,6 +169,7 @@ class GLScene {
         std::vector<std::string> idle; // clip names; empty = every clip
         float                    radius = 0.3f; // collision cylinder
         float                    height = 1.8f;
+        std::string              walk = "walk"; // clip played while walking
     };
 
     void setCharacters(const std::vector<SCharacterSpec>& specs);
@@ -200,6 +201,19 @@ class GLScene {
     // wrapping) at t in [0,1]. Shared by the drawing and by characters
     // walking the path, so they follow exactly the drawn line.
     static Vec3 pathPoint(const SPathView& p, size_t i, float t);
+
+    // Walking (a path): the walk clip plays instead of the idles.
+    void setCharacterWalking(size_t i, bool walking) {
+        if (i < m_characters.size())
+            m_characters[i].walking = walking;
+    }
+
+    // Character i's root motion at its last drawn pose (model space,
+    // unscaled; see CPlayerModel::rootMotion). The walker advances by its
+    // change, so the stride and the travel match.
+    Vec3 characterRootMotion(size_t i) const {
+        return i < m_characters.size() ? m_characters[i].root : Vec3{};
+    }
 
     // Runtime placement of character i (in setCharacters order): carrying
     // moves a character without touching its config.
@@ -387,6 +401,9 @@ class GLScene {
         std::unique_ptr<CPlayerModel> model;
         std::string                   loadedPath; // "" = not loaded yet
         std::vector<int>              idle;       // clip indices
+        int                           walkClip = -1;
+        bool                          walking  = false;
+        Vec3                          root{};     // last root motion
     };
     std::vector<SCharacter>                    m_characters;
     // Characters dropped by setCharacters: their GL objects are freed in
