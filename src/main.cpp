@@ -5056,6 +5056,14 @@ static int luaClose(lua_State*) {
     return 0;
 }
 
+// Whether the 3D view is on (or fading in): true from open until close,
+// so a config-side toggle can tell the two apart without tracking state
+// that a config reload would lose.
+static int luaActive(lua_State* L) {
+    lua_pushboolean(L, g_active && g_transitionTarget > 0.5f);
+    return 1;
+}
+
 static SDispatchResult dispatchToggle(std::string) {
     toggle3D();
     return {};
@@ -5123,6 +5131,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "open", luaOpen))
         throw std::runtime_error("[hypr3d] failed to register Lua open");
 
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "active", luaActive))
+        throw std::runtime_error("[hypr3d] failed to register Lua active");
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
 
