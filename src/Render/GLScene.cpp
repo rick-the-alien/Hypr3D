@@ -1454,8 +1454,14 @@ void GLScene::setCharacters(const std::vector<SCharacterSpec>& specs) {
                 C.model      = std::move(OLD.model);
                 C.loadedPath = OLD.loadedPath;
                 C.idle       = OLD.idle;
-                // The idle list re-resolves when it changed.
-                if (OLD.spec.idle != SPEC.idle)
+                C.walkClip   = OLD.walkClip;
+                C.runClip    = OLD.runClip;
+                C.walking    = OLD.walking;
+                C.running    = OLD.running;
+                C.root       = OLD.root;
+                // The clip lists re-resolve when they changed.
+                if (OLD.spec.idle != SPEC.idle || OLD.spec.walk != SPEC.walk ||
+                    OLD.spec.run != SPEC.run)
                     C.loadedPath.clear();
                 break;
             }
@@ -1516,6 +1522,7 @@ void GLScene::drawCharacters(const Mat4& vp, float dt) {
                         C.idle.push_back(i);
 
                 C.walkClip = C.model->animIndex(C.spec.walk);
+                C.runClip  = C.model->animIndex(C.spec.run);
 
                 C.model->setAnim(CPlayerModel::EState::Idle,
                                  pickIdle(C, -1));
@@ -1525,14 +1532,16 @@ void GLScene::drawCharacters(const Mat4& vp, float dt) {
         if (!C.model || !C.model->loaded())
             continue;
 
-        // Walking plays the walk clip (looping); otherwise random idles, a
-        // new one each time a clip ends.
-        const int CUR = C.model->currentClip();
-        if (C.walking && C.walkClip >= 0) {
-            if (CUR != C.walkClip)
-                C.model->crossfadeTo(C.walkClip);
-        } else if (CUR == C.walkClip && C.walkClip >= 0 &&
-                   !std::count(C.idle.begin(), C.idle.end(), C.walkClip))
+        // Walking plays the walk clip, running the run clip (looping);
+        // otherwise random idles, a new one each time a clip ends.
+        const int CUR  = C.model->currentClip();
+        const int MOVE = C.running && C.runClip >= 0 ? C.runClip : C.walkClip;
+        const bool MOVING_CLIP = CUR >= 0 && (CUR == C.walkClip || CUR == C.runClip);
+        if (C.walking && MOVE >= 0) {
+            if (CUR != MOVE)
+                C.model->crossfadeTo(MOVE);
+        } else if (MOVING_CLIP &&
+                   !std::count(C.idle.begin(), C.idle.end(), CUR))
             C.model->crossfadeTo(pickIdle(C, CUR));
         else if (C.model->loops() > 0)
             C.model->crossfadeTo(pickIdle(C, CUR));

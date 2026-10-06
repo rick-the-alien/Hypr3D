@@ -170,6 +170,7 @@ class GLScene {
         float                    radius = 0.3f; // collision cylinder
         float                    height = 1.8f;
         std::string              walk = "walk"; // clip played while walking
+        std::string              run  = "run";  // ... while running
     };
 
     void setCharacters(const std::vector<SCharacterSpec>& specs);
@@ -202,10 +203,13 @@ class GLScene {
     // walking the path, so they follow exactly the drawn line.
     static Vec3 pathPoint(const SPathView& p, size_t i, float t);
 
-    // Walking (a path): the walk clip plays instead of the idles.
-    void setCharacterWalking(size_t i, bool walking) {
-        if (i < m_characters.size())
+    // Walking (a path): the walk clip -- or the run clip when running --
+    // plays instead of the idles.
+    void setCharacterWalking(size_t i, bool walking, bool running) {
+        if (i < m_characters.size()) {
             m_characters[i].walking = walking;
+            m_characters[i].running = running;
+        }
     }
 
     // Character i's root motion at its last drawn pose (model space,
@@ -402,7 +406,9 @@ class GLScene {
         std::string                   loadedPath; // "" = not loaded yet
         std::vector<int>              idle;       // clip indices
         int                           walkClip = -1;
+        int                           runClip  = -1;
         bool                          walking  = false;
+        bool                          running  = false;
         Vec3                          root{};     // last root motion
     };
     std::vector<SCharacter>                    m_characters;
