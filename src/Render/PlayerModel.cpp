@@ -343,6 +343,13 @@ void CPlayerModel::setAnim(EState state, int index) {
     m_animFor[static_cast<int>(state)] = index;
 }
 
+int CPlayerModel::animIndex(const std::string& name) const {
+    for (int i = 0; i < static_cast<int>(m_anims.size()); ++i)
+        if (m_anims[i].name == name)
+            return i;
+    return -1;
+}
+
 bool CPlayerModel::setAnim(EState state, const std::string& name) {
     for (int i = 0; i < static_cast<int>(m_anims.size()); ++i) {
         if (m_anims[i].name == name) {
@@ -450,8 +457,11 @@ void CPlayerModel::update(float dt) {
     if (DUR > 0.f) {
         if (m_state == EState::Jump)
             m_time = std::min(m_time, DUR); // hold the landing pose
-        else
+        else {
+            if (m_time >= DUR)
+                ++m_loops;
             m_time = std::fmod(m_time, DUR);
+        }
     }
 
     // The crossfade: the previous clip keeps playing while the blend eases
