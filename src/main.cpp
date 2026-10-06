@@ -2141,6 +2141,16 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.pitch  = SAVED->pitch;
             entity.roll   = SAVED->roll;
         }
+        else if (info.window && info.window->parent() &&
+                 !g_world.find(Compat::windowId(info.window->parent())) &&
+                 std::any_of(INFOS.begin(), INFOS.end(), [&](const auto& I) {
+                     return I.id == Compat::windowId(info.window->parent());
+                 })) {
+            // Its parent is new to the room too (both mapped this frame):
+            // wait a frame for the parent's pose instead of spawning at the
+            // same spot and fighting it for depth.
+            continue;
+        }
         else if (const auto* DIALOG_PARENT =
                      info.window && info.window->parent()
                          ? g_world.find(Compat::windowId(info.window->parent()))
@@ -2165,11 +2175,17 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             }
 
             // Never on the far side of a wall: a spawn point behind scene
-            // geometry comes forward to just in front of it.
+            // geometry comes forward to just in front of it. Nor inside a
+            // window already there: windows opened one after another without
+            // moving would share the spot and fight for depth, so the new
+            // one stands just in front of whatever window is in the way.
             float dist = g_cfgSpawnDistance;
             if (const auto WALL = modelRayHit(CAM.position, FWD, false);
                 WALL.hit && WALL.dist < dist + 0.3f)
                 dist = std::max(0.6f, WALL.dist - 0.3f);
+            if (const auto WIN = g_world.pick(CAM.position, FWD);
+                WIN.hit && WIN.distance < dist + 0.15f)
+                dist = std::max(0.5f, WIN.distance - 0.15f);
 
             entity.center = CAM.position + FWD * dist;
 
