@@ -139,10 +139,38 @@ class CPlayerModel {
         m_state     = state;
         m_time      = 0.f;
         m_blend     = 0.f;
+        m_loops     = 0;
     }
 
     float blend() const {
         return m_blend;
+    }
+
+    // --- clip sequencing (scene characters) -------------------------------
+    // Crossfade from whatever is playing into an animation by index,
+    // independent of the movement states: the clip goes into the state slot
+    // that is not current, and that state takes over, so the regular state
+    // crossfade carries the blend. Scene characters cycle their idle clips
+    // this way.
+    void crossfadeTo(int clip) {
+        const EState NEXT =
+            m_state == EState::Idle ? EState::Walk : EState::Idle;
+        m_animFor[static_cast<int>(NEXT)] = clip;
+        setState(NEXT);
+    }
+
+    // An animation's index by name, or -1.
+    int animIndex(const std::string& name) const;
+
+    // The clip the current state plays (-1 = none).
+    int currentClip() const {
+        return m_animFor[static_cast<int>(m_state)];
+    }
+
+    // Times the current clip has wrapped since its state started; a caller
+    // cycling clips picks the next one when this ticks.
+    int loops() const {
+        return m_loops;
     }
 
     // Advance the clock and evaluate the animation into the vertex buffers.
@@ -249,6 +277,9 @@ class CPlayerModel {
     std::vector<SSampler>  m_samplers;
     std::vector<SSkin>     m_skins;
     std::vector<std::vector<Mat4>> m_skinMats; // jointWorld * invBind, per skin
+    // Per skin: true = the mesh node's world goes before the palette (the
+    // bind bakes it in), false = glTF spec (see load()).
+    std::vector<bool>      m_skinMeshWorld;
     std::vector<SPrim>     m_prims;
 
     EState m_state      = EState::Idle;
@@ -258,6 +289,7 @@ class CPlayerModel {
     int    m_animFor[kStateCount] = {-1, -1, -1, -1};
     float  m_animSpeed[kStateCount] = {1.f, 1.f, 1.f, 1.f};
     float  m_time = 0.f;
+    int    m_loops = 0; // see loops()
     Vec3   m_feet{};
     float  m_yaw = 0.f;
     Vec3   m_offset{};

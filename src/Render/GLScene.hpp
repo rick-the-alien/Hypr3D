@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -193,6 +194,24 @@ class GLScene {
         return &m_player;
     }
 
+    // --- animated characters (config: characters = { ... }) ----------------
+    // Skinned glTF models playing their clips in place. Each time a clip
+    // ends, one of the idle clips is picked at random (not the same one
+    // twice in a row when there is a choice) and crossfaded in. Matched by
+    // name across updates: a changed path reloads, anything else applies
+    // live.
+    struct SCharacterSpec {
+        std::string              name;
+        std::string              path;
+        Vec3                     position{};    // feet
+        Vec3                     rotationDeg{}; // XYZ degrees
+        Vec3                     scale{1.f, 1.f, 1.f};
+        bool                     flat = false;
+        std::vector<std::string> idle; // clip names; empty = every clip
+    };
+
+    void setCharacters(const std::vector<SCharacterSpec>& specs);
+
     void setGridVisible(bool on) {
         m_gridVisible = on;
     }
@@ -367,6 +386,21 @@ class GLScene {
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     CPlayerModel                    m_player;
+
+    struct SCharacter {
+        SCharacterSpec                spec;
+        std::unique_ptr<CPlayerModel> model;
+        std::string                   loadedPath; // "" = not loaded yet
+        std::vector<int>              idle;       // clip indices
+    };
+    std::vector<SCharacter>                    m_characters;
+    // Characters dropped by setCharacters: their GL objects are freed in
+    // render(), where the context is current.
+    std::vector<std::unique_ptr<CPlayerModel>> m_charGraveyard;
+    std::mt19937                               m_charRng{std::random_device{}()};
+
+    void drawCharacters(const Mat4& vp, float dt);
+    int  pickIdle(const SCharacter& c, int avoid);
     // Player debug capsule (F3).
     unsigned int                    m_pDbgProgram = 0, m_pDbgVAO = 0, m_pDbgVBO = 0;
     int                             m_pDbgMVP = -1;

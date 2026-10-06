@@ -1470,6 +1470,101 @@ void GLScene::refreshPlayer() {
     }
 }
 
+void GLScene::setCharacters(const std::vector<SCharacterSpec>& specs) {
+    std::vector<SCharacter> next;
+    next.reserve(specs.size());
+
+    for (const auto& SPEC : specs) {
+        SCharacter C;
+        C.spec = SPEC;
+
+        for (auto& OLD : m_characters) {
+            if (OLD.model && OLD.spec.name == SPEC.name &&
+                OLD.spec.path == SPEC.path) {
+                C.model      = std::move(OLD.model);
+                C.loadedPath = OLD.loadedPath;
+                C.idle       = OLD.idle;
+                // The idle list re-resolves when it changed.
+                if (OLD.spec.idle != SPEC.idle)
+                    C.loadedPath.clear();
+                break;
+            }
+        }
+
+        next.push_back(std::move(C));
+    }
+
+    for (auto& OLD : m_characters)
+        if (OLD.model)
+            m_charGraveyard.push_back(std::move(OLD.model));
+
+    m_characters = std::move(next);
+}
+
+int GLScene::pickIdle(const SCharacter& c, int avoid) {
+    if (c.idle.empty())
+        return -1;
+    if (c.idle.size() == 1)
+        return c.idle[0];
+
+    std::uniform_int_distribution<size_t> pick(0, c.idle.size() - 1);
+    int clip = avoid;
+    while (clip == avoid)
+        clip = c.idle[pick(m_charRng)];
+    return clip;
+}
+
+void GLScene::drawCharacters(const Mat4& vp, float dt) {
+    for (auto& DEAD : m_charGraveyard)
+        if (DEAD && DEAD->loaded())
+            DEAD->destroy();
+    m_charGraveyard.clear();
+
+    for (auto& C : m_characters) {
+        std::string path = C.spec.path;
+        if (path.starts_with('~'))
+            if (const char* HOME = getenv("HOME"))
+                path = std::string{HOME} + path.substr(1);
+
+        if (C.loadedPath != path) {
+            if (!C.model)
+                C.model = std::make_unique<CPlayerModel>();
+            // setCharacters only keeps a model whose path is unchanged, so a
+            // loaded one is the right file (only the idle list changed). A
+            // failed load is not retried every frame: loadedPath records the
+            // attempt; editing the config tries again.
+            const bool OK = C.model->loaded() || C.model->load(path);
+            C.loadedPath = path;
+
+            C.idle.clear();
+            if (OK) {
+                for (const auto& NAME : C.spec.idle)
+                    if (const int I = C.model->animIndex(NAME); I >= 0)
+                        C.idle.push_back(I);
+                if (C.idle.empty())
+                    for (int i = 0; i < C.model->animationCount(); ++i)
+                        C.idle.push_back(i);
+
+                C.model->setAnim(CPlayerModel::EState::Idle,
+                                 pickIdle(C, -1));
+            }
+        }
+
+        if (!C.model || !C.model->loaded())
+            continue;
+
+        C.model->setPose(C.spec.position, 0.f, C.spec.scale, Vec3{},
+                         C.spec.rotationDeg);
+        C.model->setFlat(C.spec.flat);
+        C.model->update(dt);
+
+        if (C.model->loops() > 0)
+            C.model->crossfadeTo(pickIdle(C, C.model->currentClip()));
+
+        C.model->draw(vp, m_camera.position);
+    }
+}
+
 void GLScene::drawPanorama(float aspect) {
     if (!m_panoramaTex || !m_panoramaProgram)
         return;
@@ -2425,6 +2520,8 @@ bool GLScene::render(
         m_player.draw(vp, m_camera.position);
     }
 
+    drawCharacters(vp, dt);
+
     if (m_gridVisible) {
         drawFloor(vp);
 
@@ -2621,6 +2718,17 @@ void GLScene::shutdown() {
         if (S.model)
             S.model->destroy();
     m_slots.clear();
+
+    for (auto& C : m_characters)
+        if (C.model && C.model->loaded())
+            C.model->destroy();
+    m_characters.clear();
+    for (auto& DEAD : m_charGraveyard)
+        if (DEAD && DEAD->loaded())
+            DEAD->destroy();
+    m_charGraveyard.clear();
+    if (m_player.loaded())
+        m_player.destroy();
     destroyGLObjects();
 }
 

@@ -5872,6 +5872,70 @@ static int luaConfig(lua_State* L) {
         lua_pop(L, 1);
     }
 
+    // characters = { name = { path, transform, flat, idle = { clips } } }:
+    // animated (skinned) glTF models playing their idle clips in place,
+    // picked at random each time a clip ends. No collision or physics yet.
+    idx = SECTION("characters", "characters");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: characters must be a table");
+    {
+        std::vector<GLScene::SCharacterSpec> CHARS;
+
+        if (idx > 0) {
+            lua_pushnil(L);
+            while (lua_next(L, idx) != 0) {
+                if (!lua_istable(L, -1) || lua_type(L, -2) != LUA_TSTRING) {
+                    lua_pop(L, 1);
+                    continue;
+                }
+
+                GLScene::SCharacterSpec C;
+                const int CIDX = lua_gettop(L);
+                C.name = lua_tostring(L, CIDX - 1);
+
+                if (!SET_STRING(CIDX, "path", C.path, "characters.<name>.path") ||
+                    !SET_BOOL(CIDX, "flat", C.flat, "characters.<name>.flat"))
+                    return luaL_error(L, "hypr3d.config: characters.%s: path must be a string, flat a boolean",
+                                      C.name.c_str());
+
+                lua_getfield(L, CIDX, "transform");
+                if (lua_istable(L, -1)) {
+                    const int TIDX = lua_gettop(L);
+                    if (!SET_VEC3(TIDX, "position", C.position, "characters.<name>.transform.position") ||
+                        !SET_VEC3(TIDX, "rotation", C.rotationDeg, "characters.<name>.transform.rotation") ||
+                        !SET_VEC3(TIDX, "scale", C.scale, "characters.<name>.transform.scale"))
+                        return luaL_error(L, "hypr3d.config: characters.%s.transform is invalid",
+                                          C.name.c_str());
+                } else if (!lua_isnil(L, -1))
+                    return luaL_error(L, "hypr3d.config: characters.%s.transform must be a table",
+                                      C.name.c_str());
+                lua_pop(L, 1);
+
+                lua_getfield(L, CIDX, "idle");
+                if (lua_istable(L, -1)) {
+                    const int IIDX = lua_gettop(L);
+                    const lua_Integer N = luaL_len(L, IIDX);
+                    for (lua_Integer i = 1; i <= N; ++i) {
+                        lua_rawgeti(L, IIDX, i);
+                        if (lua_type(L, -1) == LUA_TSTRING)
+                            C.idle.emplace_back(lua_tostring(L, -1));
+                        lua_pop(L, 1);
+                    }
+                } else if (!lua_isnil(L, -1))
+                    return luaL_error(L, "hypr3d.config: characters.%s.idle must be a list of clip names",
+                                      C.name.c_str());
+                lua_pop(L, 1);
+
+                if (!C.path.empty())
+                    CHARS.push_back(std::move(C));
+                lua_pop(L, 1); // the value; the key stays for lua_next
+            }
+            lua_pop(L, 1); // the section
+        }
+
+        g_scene.setCharacters(CHARS);
+    }
+
     g_scene.setPlayerConfig(g_playerCfg);
     for (int slot = 0; slot < 4; ++slot)
         g_scene.player()->setAnimSpeed(static_cast<CPlayerModel::EState>(slot),
