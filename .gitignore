@@ -6,3 +6,5 @@ build-warn
 docs
 r.sh
 .zcodeignore
+# Local reference material (screenshots, mockups), never committed
+reference/
