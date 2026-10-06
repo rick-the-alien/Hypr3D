@@ -155,6 +155,7 @@ Everything is optional -- only set what you want to change.
 | panorama | string | ""      | 360° background image (equirectangular) |
 | grid     | bool   | true    | the starting 40x40 platform             |
 | monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
+| tools    | bool   | false   | tool slots on keys 1-5 with a HUD bar: 1 pointer, 2 curve and 3 lines draw closed paths on the ground (left-click adds a point, right-click removes one, clicking a point converts it, pressing the tool's key again starts a new path); a character dropped onto a path walks it |
 
 ### Windows
 

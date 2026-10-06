@@ -1098,6 +1098,9 @@ struct SPath {
     std::vector<bool> smooth; // per point
 };
 
+// world.tools: the slot bar and keys 1-5 (and with them path drawing). Off,
+// digits are not taken and no HUD is drawn.
+static bool               g_cfgTools = false;
 static int                g_tool = static_cast<int>(ETool::Pointer);
 static std::vector<SPath> g_paths;
 static int                g_activePath = -1; // -1: the next click starts one
@@ -3401,7 +3404,7 @@ static void update3D(float dt) {
                                     g_chars[i].running);
     }
     syncCharacterBodies();
-    g_scene.setHud(g_tool, toolLabels());
+    g_scene.setHud(g_tool, g_cfgTools ? toolLabels() : std::vector<std::string>{});
     {
         std::vector<GLScene::SPathView> VIEWS;
         VIEWS.reserve(g_paths.size());
@@ -4861,7 +4864,7 @@ static void onKeyboardKey(
         return;
 
     // 1-5 pick a tool (Super + digit stays the compositor's).
-    if (!g_superHeld && SYM >= XKB_KEY_1 && SYM <= XKB_KEY_5) {
+    if (g_cfgTools && !g_superHeld && SYM >= XKB_KEY_1 && SYM <= XKB_KEY_5) {
         if (PRESSED) {
             const int TOOL = static_cast<int>(SYM - XKB_KEY_0);
             // The active path tool's key again: the next point starts a new
@@ -5074,6 +5077,10 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.panorama must be a string");
         if (!SET_STRING(idx, "monitor", g_cfgMonitor, "world.monitor"))
             return luaL_error(L, "hypr3d.config: world.monitor must be a string");
+        if (!SET_BOOL(idx, "tools", g_cfgTools, "world.tools"))
+            return luaL_error(L, "hypr3d.config: world.tools must be a boolean");
+        if (!g_cfgTools)
+            g_tool = static_cast<int>(ETool::Pointer);
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         lua_pop(L, 1);
