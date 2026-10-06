@@ -167,9 +167,20 @@ class GLScene {
         Vec3                     scale{1.f, 1.f, 1.f};
         bool                     flat = false;
         std::vector<std::string> idle; // clip names; empty = every clip
+        float                    radius = 0.3f; // collision cylinder
+        float                    height = 1.8f;
     };
 
     void setCharacters(const std::vector<SCharacterSpec>& specs);
+
+    // Runtime placement of character i (in setCharacters order): carrying
+    // moves a character without touching its config.
+    void setCharacterPose(size_t i, const Vec3& position, const Vec3& rotationDeg) {
+        if (i < m_characters.size()) {
+            m_characters[i].spec.position    = position;
+            m_characters[i].spec.rotationDeg = rotationDeg;
+        }
+    }
 
     void setGridVisible(bool on) {
         m_gridVisible = on;
