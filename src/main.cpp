@@ -1102,6 +1102,10 @@ struct SPath {
 // digits are not taken and no HUD is drawn.
 static bool               g_cfgTools = false;
 static int                g_tool = static_cast<int>(ETool::Pointer);
+
+// A press the plugin consumed (a path point, a click on a character): its
+// release is swallowed too, so no client sees an unpaired release.
+static uint32_t g_swallowRelease = 0;
 static std::vector<SPath> g_paths;
 static int                g_activePath = -1; // -1: the next click starts one
 
@@ -4349,6 +4353,12 @@ static void onMouseButton(
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
+
+    if (!PRESSED && g_swallowRelease == event.button) {
+        g_swallowRelease = 0;
+        info.cancelled = true;
+        return;
+    }
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
