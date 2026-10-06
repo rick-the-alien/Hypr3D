@@ -181,13 +181,25 @@ class GLScene {
         m_hudLabels = labels;
     }
 
-    // A closed path on the ground: a smooth curve through the points
-    // (Catmull-Rom) or straight segments. `editing` also marks the points.
-    void setPath(const std::vector<Vec3>& points, bool smooth, bool editing) {
-        m_pathPoints  = points;
-        m_pathSmooth  = smooth;
+    // Closed paths on the ground. Each point is smooth (the curve bends
+    // through it; drawn as a circle) or sharp (a corner; a square). The
+    // active path is drawn brighter; `editing` also shows the points, the
+    // start (green ring + direction chevron) and the end (orange ring).
+    struct SPathView {
+        std::vector<Vec3> points;
+        std::vector<bool> smooth;
+    };
+
+    void setPaths(const std::vector<SPathView>& paths, int active, bool editing) {
+        m_paths       = paths;
+        m_pathActive  = active;
         m_pathEditing = editing;
     }
+
+    // A point on the closed path's curve: segment i (from point i to i+1,
+    // wrapping) at t in [0,1]. Shared by the drawing and by characters
+    // walking the path, so they follow exactly the drawn line.
+    static Vec3 pathPoint(const SPathView& p, size_t i, float t);
 
     // Runtime placement of character i (in setCharacters order): carrying
     // moves a character without touching its config.
@@ -405,8 +417,8 @@ class GLScene {
 
     int                             m_hudActive = 1;
     std::vector<std::string>        m_hudLabels;
-    std::vector<Vec3>               m_pathPoints;
-    bool                            m_pathSmooth  = true;
+    std::vector<SPathView>          m_paths;
+    int                             m_pathActive  = -1;
     bool                            m_pathEditing = false;
 
     // Scene slots: one per config object, index-aligned with the specs.

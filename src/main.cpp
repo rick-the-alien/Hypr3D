@@ -1072,27 +1072,72 @@ static void carryCharacter(float dt) {
 //
 // Weapon-style tool slots in moving mode, shown on the HUD slot bar:
 //   1 pointer (default) -- the crosshair as before
-//   2 curve -- left-click drops a point on the ground under the crosshair,
-//              right-click removes the last one; the path closes itself and
-//              is drawn as a smooth curve through the points (Catmull-Rom)
-//   3 lines -- the same path drawn as straight segments
+//   2 curve -- left-click drops a smooth point (the curve bends through
+//              it) on the ground under the crosshair
+//   3 lines -- the same with a sharp point (a corner)
 //   4, 5    -- free
-// One path for now, in plugin memory; meant for characters to walk.
+// Paths close themselves; new points go after the active path's end (just
+// before its start). Clicking an existing point converts it to the tool's
+// type and makes its path active; right-click deletes the point under the
+// crosshair, else the active path's last one, and a path without points is
+// gone. Pressing the active path tool's key again starts a new path. Plugin
+// memory only; meant for characters to walk.
 
 enum class ETool : int { Pointer = 1, Curve = 2, Lines = 3 };
 
-static int               g_tool = static_cast<int>(ETool::Pointer);
-static std::vector<Vec3> g_pathPoints;
-static bool              g_pathSmooth = true;
+struct SPath {
+    std::vector<Vec3> points;
+    std::vector<bool> smooth; // per point
+};
+
+static int                g_tool = static_cast<int>(ETool::Pointer);
+static std::vector<SPath> g_paths;
+static int                g_activePath = -1; // -1: the next click starts one
 
 static bool pathTool() {
     return g_tool == static_cast<int>(ETool::Curve) ||
         g_tool == static_cast<int>(ETool::Lines);
 }
 
-static const std::vector<std::string>& toolLabels() {
-    static const std::vector<std::string> LABELS = {"POINTER", "CURVE", "LINES", "", ""};
-    return LABELS;
+// HUD labels; the path tools show which path new points go to.
+static std::vector<std::string> toolLabels() {
+    const std::string WHICH = g_activePath >= 0 &&
+            g_activePath < static_cast<int>(g_paths.size())
+        ? "P" + std::to_string(g_activePath + 1) : "NEW";
+    return {"POINTER", "CURVE " + WHICH, "LINES " + WHICH, "", ""};
+}
+
+// The path point nearest a ground position (within reach), as
+// (path, point), or (-1, -1).
+static std::pair<int, int> pathPointNear(const Vec3& at) {
+    constexpr float REACH = 0.35f;
+    std::pair<int, int> best{-1, -1};
+    float bestD = REACH * REACH;
+    for (size_t p = 0; p < g_paths.size(); ++p)
+        for (size_t i = 0; i < g_paths[p].points.size(); ++i) {
+            const Vec3 D = g_paths[p].points[i] - at;
+            if (std::fabs(D.y) > 0.6f)
+                continue;
+            const float D2 = D.x * D.x + D.z * D.z;
+            if (D2 < bestD) {
+                bestD = D2;
+                best  = {static_cast<int>(p), static_cast<int>(i)};
+            }
+        }
+    return best;
+}
+
+static void removePathPoint(int p, int i) {
+    auto& P = g_paths[p];
+    P.points.erase(P.points.begin() + i);
+    P.smooth.erase(P.smooth.begin() + i);
+    if (P.points.empty()) {
+        g_paths.erase(g_paths.begin() + p);
+        if (g_activePath == p)
+            g_activePath = -1;
+        else if (g_activePath > p)
+            --g_activePath;
+    }
 }
 
 // A path point on the ground under the crosshair: the nearest collidable
@@ -3219,7 +3264,13 @@ static void update3D(float dt) {
         carryCharacter(dt);
     syncCharacterBodies();
     g_scene.setHud(g_tool, toolLabels());
-    g_scene.setPath(g_pathPoints, g_pathSmooth, pathTool());
+    {
+        std::vector<GLScene::SPathView> VIEWS;
+        VIEWS.reserve(g_paths.size());
+        for (const auto& P : g_paths)
+            VIEWS.push_back({P.points, P.smooth});
+        g_scene.setPaths(VIEWS, g_activePath, pathTool());
+    }
     for (size_t i = 0; i < g_chars.size(); ++i)
         g_scene.setCharacterPose(
             i, g_chars[i].feet,
@@ -4171,12 +4222,32 @@ static void onMouseButton(
     if (pathTool() && !g_superHeld &&
         (event.button == BTN_LEFT || event.button == BTN_RIGHT)) {
         if (PRESSED) {
-            if (event.button == BTN_LEFT) {
-                Vec3 P;
-                if (groundUnderCrosshair(P))
-                    g_pathPoints.push_back(P);
-            } else if (!g_pathPoints.empty())
-                g_pathPoints.pop_back();
+            const bool SMOOTH = g_tool == static_cast<int>(ETool::Curve);
+            Vec3 at;
+            const bool ON_GROUND = groundUnderCrosshair(at);
+            const auto NEAR = ON_GROUND ? pathPointNear(at)
+                                        : std::pair<int, int>{-1, -1};
+
+            if (event.button == BTN_LEFT && NEAR.first >= 0) {
+                // An existing point: take the tool's type, and its path
+                // becomes the one being extended.
+                g_paths[NEAR.first].smooth[NEAR.second] = SMOOTH;
+                g_activePath = NEAR.first;
+            } else if (event.button == BTN_LEFT && ON_GROUND) {
+                if (g_activePath < 0 ||
+                    g_activePath >= static_cast<int>(g_paths.size())) {
+                    g_paths.push_back({});
+                    g_activePath = static_cast<int>(g_paths.size()) - 1;
+                }
+                g_paths[g_activePath].points.push_back(at);
+                g_paths[g_activePath].smooth.push_back(SMOOTH);
+            } else if (event.button == BTN_RIGHT && NEAR.first >= 0)
+                removePathPoint(NEAR.first, NEAR.second);
+            else if (event.button == BTN_RIGHT && g_activePath >= 0 &&
+                     g_activePath < static_cast<int>(g_paths.size()))
+                removePathPoint(g_activePath,
+                                static_cast<int>(g_paths[g_activePath].points.size()) - 1);
+
             g_swallowRelease = event.button;
             damageCurrentMonitor();
         }
@@ -4622,11 +4693,12 @@ static void onKeyboardKey(
     // 1-5 pick a tool (Super + digit stays the compositor's).
     if (!g_superHeld && SYM >= XKB_KEY_1 && SYM <= XKB_KEY_5) {
         if (PRESSED) {
-            g_tool = static_cast<int>(SYM - XKB_KEY_0);
-            if (g_tool == static_cast<int>(ETool::Curve))
-                g_pathSmooth = true;
-            else if (g_tool == static_cast<int>(ETool::Lines))
-                g_pathSmooth = false;
+            const int TOOL = static_cast<int>(SYM - XKB_KEY_0);
+            // The active path tool's key again: the next point starts a new
+            // path.
+            if (TOOL == g_tool && pathTool())
+                g_activePath = -1;
+            g_tool = TOOL;
             damageCurrentMonitor();
         }
         info.cancelled = true;
