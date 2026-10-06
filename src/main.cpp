@@ -359,7 +359,11 @@ static bool g_hookInstalled = false;
 // --- world ------------------------------------------------------------------
 static std::string g_cfgPanorama;                // panorama image path
 static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
-static bool        g_cfgGrid = true;             // base grid platform on/off
+static bool        g_cfgGrid = true;
+// world.under_layers: draw the room under the top and overlay layers (bars,
+// launchers, notifications stay 2D on top and take input) instead of over
+// everything.
+static bool        g_cfgUnderLayers = false;             // base grid platform on/off
 
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
@@ -1181,7 +1185,7 @@ static void ghostWindows(const PHLMONITOR& mon) {
     if (!mon)
         return;
 
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    const auto INFOS = Compat::enumerateEligibleWindows(mon, g_cfgUnderLayers);
 
     if (!g_ghosted) {
         // First pass: save EVERY window before ghosting any of them, since
@@ -1440,7 +1444,7 @@ static void serviceCapture() {
     g_capturing = true;
 
     ghostWindows(MON);
-    refreshCaptures(Compat::enumerateEligibleWindows(MON), MON);
+    refreshCaptures(Compat::enumerateEligibleWindows(MON, g_cfgUnderLayers), MON);
 
     g_capturing = false;
 }
@@ -1511,7 +1515,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // monitor blur FBs; the compositor's outer endRender() then aborted in
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    const auto INFOS = Compat::enumerateEligibleWindows(mon, g_cfgUnderLayers);
 
     g_winOutlines.clear();
 
@@ -4101,7 +4105,7 @@ static void vcResolveScreen(const PHLMONITOR& mon) {
     // A bar, sidebar, launcher or notification drawn over the room: hand
     // the pointer to the real cursor there, Hyprland drives it natively.
     if (const Vector2D GLOBAL = mon->m_position + g_vcScreen;
-        Compat::interactiveLayerAt(mon, GLOBAL)) {
+        g_cfgUnderLayers && Compat::interactiveLayerAt(mon, GLOBAL)) {
         vcLeaveToDesktop(GLOBAL);
         return;
     }
@@ -4151,7 +4155,7 @@ static void vcMove(double dx, double dy) {
 
             if (INSIDE) {
                 // The part of the window under a bar is the bar's.
-                if (ON_SCREEN &&
+                if (ON_SCREEN && g_cfgUnderLayers &&
                     Compat::interactiveLayerAt(MON, MON->m_position + projected)) {
                     g_vcScreen = projected;
                     vcLeaveToDesktop(MON->m_position + projected);
@@ -4329,9 +4333,10 @@ static void onRenderStage(eRenderStage stage) {
     if (!g_monitor)
         return;
 
-    // After the windows, before the top and overlay layers: bars,
-    // launchers and notifications draw over the room as ordinary 2D.
-    if (stage != RENDER_POST_WINDOWS)
+    // world.under_layers: after the windows, before the top and overlay
+    // layers -- bars, launchers and notifications draw over the room as
+    // ordinary 2D. Otherwise the room covers everything.
+    if (stage != (g_cfgUnderLayers ? RENDER_POST_WINDOWS : RENDER_LAST_MOMENT))
         return;
 
     if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
@@ -4473,7 +4478,8 @@ static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
             // Over a layer on the room monitor the real cursor stays: the
             // bar and its popups get ordinary input.
             if (onRoomMonitor(pos) &&
-                !Compat::interactiveLayerAt(targetMonitor(), pos)) {
+                !(g_cfgUnderLayers &&
+                  Compat::interactiveLayerAt(targetMonitor(), pos))) {
                 vcEnterFromDesktop(pos);
                 info.cancelled = true;
             }
@@ -5437,6 +5443,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.panorama must be a string");
         if (!SET_STRING(idx, "monitor", g_cfgMonitor, "world.monitor"))
             return luaL_error(L, "hypr3d.config: world.monitor must be a string");
+        if (!SET_BOOL(idx, "under_layers", g_cfgUnderLayers, "world.under_layers"))
+            return luaL_error(L, "hypr3d.config: world.under_layers must be a boolean");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         lua_pop(L, 1);
