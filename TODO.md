@@ -49,6 +49,14 @@ indicator).
 
 ## Loose ends
 
+- **Thick windows hid terminals (2026-10-06):** with `windows.depth = 0.05`
+  (upstream's volumetric windows) and many kitty windows (16 spawned at the
+  same box), some terminals drew fully clear -- only their edge walls --
+  while still occluding windows behind them (holes through a Paseo window).
+  Their silhouette masks were coarse (512x293) with few outline points.
+  Closing them and restarting cleared it; running with `depth = 0` since.
+  Not reproduced or root-caused yet; likely upstream's slab/outline path.
+
 - **Scene changes need a plugin reload:** switching `scene.map.path` (and
   its transform) in the config and running `hyprctl reload` did not load
   the new model; it only appeared after `reload.sh`. Probably the scene
