@@ -4,7 +4,11 @@
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 
+#include "World/Outline.hpp"
+
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 
 namespace H3D::Compat {
@@ -58,9 +62,49 @@ class CWindowCapture {
         bool alphaValid = false;
         unsigned int maskAge = 0;
 
+        // Depth-slab silhouette: closed outlines of the captured alpha in
+        // normalized box coords (row 0 = top). Windows: the snapshot
+        // texture is drawn into a small owned FBO first (the GPU samples
+        // the snapshot's alpha correctly -- glReadPixels on the snapshot FB
+        // itself returns garbage) and the mask is traced from that.
+        // Layers: traced straight from the picking alphaMask. The outline
+        // itself is OWNED by the per-window cadence state (it must survive
+        // the snapshot object being recreated on every content update);
+        // this pointer is refreshed into each new snapshot.
+        std::shared_ptr<const std::vector<H3D::SOutlineLoop>> outlines;
+
+        // Diagnostics for the status dump (the mask bytes and cadence live
+        // in the per-window state below).
+        int  skirtW     = 0;
+        int  skirtH     = 0;
+        bool skirtValid = false;
+        // Last refresh failure: 0 ok, 1 no texture, 2 FBO/shader setup
+        // failed, 3 empty region, 4 GL error.
+        int  skirtError = 0;
+
         // Identity of the client's last-committed buffer at snapshot time:
         // the cheap "did the content change" signal between frames.
         std::uintptr_t lastBuffer = 0;
+    };
+
+    // Per-window silhouette state: the traced outline + the cadence
+    // bookkeeping. Lives across snapshot recreations (the snapshot object
+    // is recreated on every content update); entries die with
+    // release/retainOnly/releaseAll, like the snapshots themselves.
+    struct SSkirtState {
+        int  w = 0, h = 0;       // mask size the outline was traced from
+        int  boxW = 0, boxH = 0; // logical box size it was built for
+        int  lastBoxW = -1, lastBoxH = -1; // box on the previous snapshot
+        bool valid = false;
+        unsigned int age = 0;
+        // Refresh throttle: during a drag-resize the box changes every
+        // frame, and a native-resolution copy per frame tanks the FPS --
+        // so mid-drag refreshes run at a reduced mask cap and no more
+        // often than this interval. The full-resolution trace is saved
+        // for the frame the box settles (stopped changing while stale).
+        std::chrono::steady_clock::time_point lastRefresh{};
+        bool hasTime = false;
+        std::shared_ptr<const std::vector<H3D::SOutlineLoop>> outlines;
     };
 
     // Renders a fresh snapshot of `window` (uses the focused monitor's output).
@@ -86,6 +130,18 @@ class CWindowCapture {
         bool              force
     );
 
+    // (Re)traces the depth-slab silhouette for a captured snapshot: draws
+    // the snapshot texture's box region into a small owned FBO (a GPU-side
+    // copy -- the only reliable way to see the snapshot's real alpha) and
+    // traces the outline. Rare by design: on a box size change or every
+    // 64th snapshot -- the cadence state and the traced outline live in a
+    // per-window map, because the snapshot object itself is recreated on
+    // every content update and would otherwise reset the cadence to "now"
+    // (a native-resolution readback on every frame of an animating window).
+    void refreshSkirtMask(std::uintptr_t id, SSnapshot& snapshot,
+                          const PHLMONITOR& monitor);
+    void refreshSkirtMaskTiled(std::uintptr_t id, SSnapshot& snapshot);
+
     void destroySnapshotGL(SSnapshot& snapshot);
 
   public:
@@ -109,6 +165,7 @@ class CWindowCapture {
 
   private:
     std::unordered_map<std::uintptr_t, SSnapshot> m_snapshots;
+    std::unordered_map<std::uintptr_t, SSkirtState> m_skirtStates;
 };
 
 } // namespace H3D::Compat

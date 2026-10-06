@@ -671,27 +671,89 @@ float CMapCollision::rayCast(const Vec3& origin, const Vec3& dir) const {
     if (m_tris.empty() || m_nodes.empty())
         return -1.f;
 
-    // Walk nodes whose AABB the ray's AABB intersects; then Möller–Trumbore.
-    // A proper ray-AABB slab test would be tighter, but the ray's bounding
-    // box query keeps this correct and simple.
-    Vec3 lo = origin, hi = origin;
-    // Extend 1000 units along the ray to bound the query region.
-    const Vec3 FAR = origin + dir * 1000.f;
-    lo = {std::min(lo.x, FAR.x), std::min(lo.y, FAR.y), std::min(lo.z, FAR.z)};
-    hi = {std::max(hi.x, FAR.x), std::max(hi.y, FAR.y), std::max(hi.z, FAR.z)};
+    // Down the tree with a slab test per node (Williams et al., "An Efficient
+    // and Robust Ray-Box Intersection Algorithm", 2005), the nearer child
+    // first, skipping every node that starts beyond the nearest hit so far.
+    // Querying the tree with the ray's bounding box instead took in nearly
+    // every triangle of a model one looks at: one aim ray cost ~1 ms a frame
+    // at a 47 MB model. Hits stay within the 1000 units that box reached.
+    constexpr float kFar = 1000.f;
 
-    std::vector<uint32_t> near_;
-    query(lo, hi, near_);
+    // A zero component would give an infinite inverse, and 0 * inf is NaN on
+    // a box face; a tiny one keeps every slab distance a number.
+    const auto INVERSE = [](float d) {
+        return 1.f / (std::fabs(d) > 1e-20f ? d : std::copysign(1e-20f, d));
+    };
+    const Vec3 INV{INVERSE(dir.x), INVERSE(dir.y), INVERSE(dir.z)};
 
-    float best = -1.f;
-    for (const auto I : near_) {
-        float t = -1.f;
-        if (rayTriangle(origin, dir, m_tris[I], t))
-            if (best < 0.f || t < best)
-                best = t;
+    // Where the ray enters a node's box, or -1 when it misses it before LIMIT.
+    // The exit is widened by pbrt's 1 + 2 * gamma(3) so rounding cannot drop
+    // a box the ray only grazes -- a floor's box is flat.
+    const auto ENTRY = [&](const SNode& n, float limit) {
+        float t0 = 0.f, t1 = limit;
+        const auto SLAB = [&](float lo, float hi, float o, float inv) {
+            float a = (lo - o) * inv, b = (hi - o) * inv;
+            if (a > b)
+                std::swap(a, b);
+            t0 = std::max(t0, a);
+            t1 = std::min(t1, b * 1.0000004f);
+        };
+        SLAB(n.min.x, n.max.x, origin.x, INV.x);
+        SLAB(n.min.y, n.max.y, origin.y, INV.y);
+        SLAB(n.min.z, n.max.z, origin.z, INV.z);
+        return t0 <= t1 ? t0 : -1.f;
+    };
+
+    float best  = kFar;
+    bool  found = false;
+
+    struct SVisit {
+        int32_t node;
+        float   entry;
+    };
+    std::vector<SVisit> stack;
+    stack.reserve(64);
+
+    if (const float T = ENTRY(m_nodes[0], best); T >= 0.f)
+        stack.push_back({0, T});
+
+    while (!stack.empty()) {
+        const auto VISIT = stack.back();
+        stack.pop_back();
+
+        if (VISIT.entry > best)
+            continue;
+
+        const auto& NODE = m_nodes[VISIT.node];
+
+        if (NODE.left < 0 && NODE.right < 0) {
+            for (uint32_t i = 0; i < NODE.count; ++i) {
+                float t = -1.f;
+                if (rayTriangle(origin, dir, m_tris[m_order[NODE.start + i]], t) &&
+                    t <= best) {
+                    best  = t;
+                    found = true;
+                }
+            }
+            continue;
+        }
+
+        const float TL = NODE.left >= 0 ? ENTRY(m_nodes[NODE.left], best) : -1.f;
+        const float TR = NODE.right >= 0 ? ENTRY(m_nodes[NODE.right], best) : -1.f;
+
+        // The nearer child goes on top, so it is walked first.
+        if (TL >= 0.f && TR >= 0.f) {
+            const bool LEFT_FIRST = TL <= TR;
+            stack.push_back({LEFT_FIRST ? NODE.right : NODE.left, LEFT_FIRST ? TR : TL});
+            stack.push_back({LEFT_FIRST ? NODE.left : NODE.right, LEFT_FIRST ? TL : TR});
+        } else if (TL >= 0.f) {
+            stack.push_back({NODE.left, TL});
+        } else if (TR >= 0.f) {
+            stack.push_back({NODE.right, TR});
+        }
     }
 
-    return best;
+    return found ? best : -1.f;
 }
 
 } // namespace H3D

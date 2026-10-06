@@ -65,6 +65,7 @@ extern "C" {
 #include "HyprlandCompat/PointerHook.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -73,6 +74,7 @@ extern "C" {
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -120,6 +122,21 @@ static bool g_ghosted = false;
 
 // What to draw this frame, rebuilt once per frame from the world.
 static std::vector<GLScene::WindowRender> g_renderWindows;
+
+// Per-window depth-slab silhouette (analytic rounded rectangle), rebuilt
+// when the captured box or the reported corner radius changes. Cleared with
+// the frame -- entries for closed windows die with it.
+struct SWinOutline {
+    int w = 0, h = 0, r = -1;
+    std::shared_ptr<const std::vector<SOutlineLoop>> loops;
+};
+static std::unordered_map<std::uintptr_t, SWinOutline> g_winOutlines;
+
+// Set when a resize gesture ends: the next capture pass makes one FORCED
+// snapshot of that window, so the wall silhouette runs its full-resolution
+// "box settled" refresh -- an idle window would otherwise never snapshot
+// again and keep the last mid-drag (reduced-resolution) outline.
+static std::uintptr_t g_skirtFinalRefreshId = 0;
 
 // The window that currently owns keyboard focus, as the aim logic last set it.
 static std::uintptr_t g_lastFocusId = 0;
@@ -338,6 +355,7 @@ static bool        g_cfgGrid = true;             // base grid platform on/off
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
+static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat quads
 
 // --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
@@ -351,7 +369,11 @@ static bool        g_playerNoclip     = false;   // pass through everything (V)
 static bool playerFlies() {
     return g_playerFlying || g_playerNoclip;
 }
+static bool        g_playerCollision  = true;    // reserved: the capsule is
+        // the movement system, so this only gates future per-object contact
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
+static GLScene::SPlayerCfg g_playerCfg;          // the player character
+static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
 
 // Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
 // the grid platform at world zero).
@@ -366,7 +388,7 @@ struct SSceneObjectCfg {
     std::string path;
     Vec3        position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
     float       emissiveScale = 1.0f;
-    bool        flat = true;
+    bool        flat = false; // false = headlight half-lambert shading
     bool        collision = true;
     bool        dynamic = false; // static = false -> grabbable with Super+LMB
     bool        physics = false; // gravity + world collisions (dynamic only)
@@ -410,6 +432,11 @@ static bool  g_zoomHeld  = false;
 static float g_zoomWheel = 2.0f;
 static float g_zoomLevel = 1.0f;
 static constexpr float kZoomBase = 2.0f;
+
+// F5 view modes: 0 first person, 1 third person behind, 2 third person front.
+static int g_viewMode = 0;
+static float g_playerCamDist = 0.f; // smoothed third-person distance
+static constexpr float kThirdDist = 2.5f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
 // object, used by picking (modelRayHit). The static map's tree builds once;
@@ -488,6 +515,29 @@ struct SObjJolt {
 };
 static std::vector<SObjJolt> g_joltBodies;
 
+// A static object's mesh shape, cooked off the main thread: Jolt building
+// the MeshShape of a 95 000-triangle model held Hyprland ~180 ms (-O2,
+// perf). Jolt is made for this -- MeshShape creation was tuned for many
+// threads building meshes at once.
+struct SShapeJob {
+    uint32_t             meshGen = 0; // what the shape is built from
+    Vec3                 scale{}, pivot{};
+    JPH::Ref<JPH::Shape> shape;       // empty when Jolt refused the mesh
+    std::atomic<bool>    done{false};
+    std::jthread         thread;      // last: joined before the rest goes
+};
+static std::vector<std::unique_ptr<SShapeJob>> g_shapeJobs; // by object
+
+// A static object's first shape is still cooking: there is nothing to stand
+// on yet where it will be.
+static bool joltShapesPending() {
+    for (size_t i = 0; i < g_shapeJobs.size() && i < g_joltBodies.size(); ++i)
+        if (g_shapeJobs[i] && !g_joltBodies[i].valid &&
+            !g_shapeJobs[i]->done.load(std::memory_order_acquire))
+            return true;
+    return false;
+}
+
 // Gravity factor saved while a wheel-roll gesture suspends the object's
 // simulation (captured ONCE at grab -- re-reading it per frame would store
 // the suspended zero and never restore it).
@@ -502,10 +552,10 @@ static float g_rolledGravity = 1.0f;
 
 
 static bool joltInit() {
-    // Keyed on the system itself, not a once-flag: the plugin .so is never
-    // really unmapped (Hyprland's headers give it STB_GNU_UNIQUE symbols, so
-    // dlclose is a no-op), and loading the same path again re-runs
-    // PLUGIN_INIT on these statics after joltShutdown.
+    // Keyed on the system itself, not a once-flag: a build with
+    // STB_GNU_UNIQUE symbols (anything not built with -fno-gnu-unique) is
+    // never unmapped, and loading the same path again re-runs PLUGIN_INIT
+    // on these statics after joltShutdown.
     if (g_joltSystem)
         return true;
 
@@ -523,6 +573,8 @@ static bool joltInit() {
 }
 
 static void joltShutdown() {
+    // A shape still cooking finishes first; Jolt cannot stop mid-build.
+    g_shapeJobs.clear();
     g_bodyIf = nullptr;
 
     if (g_joltSystem) {
@@ -674,6 +726,7 @@ static Vec3 quatToEuler(const JPH::Quat& q) {
 
 static void joltSyncBodies() {
     g_joltBodies.resize(g_sceneObjects.size());
+    g_shapeJobs.resize(g_sceneObjects.size());
 
     for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
         auto& JB = g_joltBodies[i];
@@ -685,6 +738,7 @@ static void joltSyncBodies() {
         const uint32_t MESH_VER = MODEL ? MODEL->meshVersion() : 0;
 
         if (!WANT) {
+            g_shapeJobs[i].reset();
             if (JB.valid) {
                 g_bodyIf->RemoveBody(JB.body);
                 g_bodyIf->DestroyBody(JB.body);
@@ -705,12 +759,6 @@ static void joltSyncBodies() {
             JB.builtPivot.y != PIV.y || JB.builtPivot.z != PIV.z;
 
         if (!JB.valid || JB.meshGen != MESH_VER || MAPPING_CHANGED) {
-            if (JB.valid) {
-                g_bodyIf->RemoveBody(JB.body);
-                g_bodyIf->DestroyBody(JB.body);
-                JB = {};
-            }
-
             // Body-space triangles: the mesh scaled, with the PIVOT at the
             // body origin. The body transform (config position/rotation)
             // then maps body space onto the world exactly like the render
@@ -719,30 +767,13 @@ static void joltSyncBodies() {
             // (World-baked vertices here would apply the body transform a
             // SECOND time: an object placed at {2,0,1} got its collision at
             // {4,0,2}.)
-            const auto BODY_PT = [&](const Vec3& p) {
+            const auto BODY_PT = [SCL, PIV](const Vec3& p) {
                 return Vec3{SCL.x * p.x - SCL.x * PIV.x,
                             SCL.y * p.y - SCL.y * PIV.y,
                             SCL.z * p.z - SCL.z * PIV.z};
             };
 
             const auto& LOCAL = MODEL->localTriangles();
-            JPH::TriangleList TL;
-            // Two-sided: each triangle twice (both windings) -- Jolt's
-            // narrow phase ignores back faces, and single-sided authored
-            // geometry (ceilings!) would let bodies tunnel through.
-            TL.reserve(LOCAL.size() * 2);
-            for (const auto& T : LOCAL) {
-                const Vec3 A = BODY_PT(T.a), B = BODY_PT(T.b),
-                           C = BODY_PT(T.c);
-                TL.push_back(JPH::Triangle(
-                    JPH::Float3(A.x, A.y, A.z),
-                    JPH::Float3(B.x, B.y, B.z),
-                    JPH::Float3(C.x, C.y, C.z)));
-                TL.push_back(JPH::Triangle(
-                    JPH::Float3(A.x, A.y, A.z),
-                    JPH::Float3(C.x, C.y, C.z),
-                    JPH::Float3(B.x, B.y, B.z)));
-            }
 
             const bool DYN = OBJ.dynamic && OBJ.physics;
             const JPH::EMotionType MOTION =
@@ -754,14 +785,71 @@ static void joltSyncBodies() {
 
             JPH::Ref<JPH::Shape> SHAPE;
             if (MOTION == JPH::EMotionType::Static) {
-                // Static meshes keep their exact triangle soup.
-                JPH::MeshShapeSettings SETTINGS(TL);
-                SETTINGS.SetEmbedded();
-                auto RES = SETTINGS.Create();
-                if (RES.HasError())
+                // Static meshes keep their exact triangle soup, cooked on a
+                // worker. The old body stays until the new shape is there.
+                auto& JOB = g_shapeJobs[i];
+                const bool CURRENT = JOB && JOB->meshGen == MESH_VER &&
+                    JOB->scale.x == SCL.x && JOB->scale.y == SCL.y &&
+                    JOB->scale.z == SCL.z && JOB->pivot.x == PIV.x &&
+                    JOB->pivot.y == PIV.y && JOB->pivot.z == PIV.z;
+
+                if (!CURRENT) {
+                    JOB.reset(); // an outdated one is waited for
+                    JOB          = std::make_unique<SShapeJob>();
+                    JOB->meshGen = MESH_VER;
+                    JOB->scale   = SCL;
+                    JOB->pivot   = PIV;
+                    JOB->thread  = std::jthread([J = JOB.get(), LOCAL, BODY_PT] {
+                        // An exception leaving this thread would terminate
+                        // Hyprland.
+                        try {
+                            JPH::TriangleList TL;
+                            // Two-sided: each triangle twice (both windings)
+                            // -- Jolt's narrow phase ignores back faces, and
+                            // single-sided authored geometry (ceilings!)
+                            // would let bodies tunnel through.
+                            TL.reserve(LOCAL.size() * 2);
+                            for (const auto& T : LOCAL) {
+                                const Vec3 A = BODY_PT(T.a), B = BODY_PT(T.b),
+                                           C = BODY_PT(T.c);
+                                TL.push_back(JPH::Triangle(
+                                    JPH::Float3(A.x, A.y, A.z),
+                                    JPH::Float3(B.x, B.y, B.z),
+                                    JPH::Float3(C.x, C.y, C.z)));
+                                TL.push_back(JPH::Triangle(
+                                    JPH::Float3(A.x, A.y, A.z),
+                                    JPH::Float3(C.x, C.y, C.z),
+                                    JPH::Float3(B.x, B.y, B.z)));
+                            }
+
+                            JPH::MeshShapeSettings SETTINGS(TL);
+                            SETTINGS.SetEmbedded();
+                            auto RES = SETTINGS.Create();
+                            if (!RES.HasError())
+                                J->shape = RES.Get();
+                        } catch (...) {
+                            J->shape = nullptr;
+                        }
+                        J->done.store(true, std::memory_order_release);
+                    });
                     continue;
-                SHAPE = RES.Get();
+                }
+
+                // Still cooking, or Jolt refused this mesh (kept, so it is
+                // not tried again until the mesh changes).
+                if (!JOB->done.load(std::memory_order_acquire) || !JOB->shape)
+                    continue;
+
+                JOB->thread.join();
+                SHAPE = JOB->shape;
+                JOB.reset();
             } else {
+                if (JB.valid) {
+                    g_bodyIf->RemoveBody(JB.body);
+                    g_bodyIf->DestroyBody(JB.body);
+                    JB = {};
+                }
+
                 // Dynamic/kinematic bodies use a convex hull (Jolt requires
                 // it; the hull also tumbles believably).
                 JPH::Array<JPH::Vec3> POINTS;
@@ -778,6 +866,12 @@ static void joltSyncBodies() {
                 if (RES.HasError())
                     continue;
                 SHAPE = RES.Get();
+            }
+
+            if (JB.valid) {
+                g_bodyIf->RemoveBody(JB.body);
+                g_bodyIf->DestroyBody(JB.body);
+                JB = {};
             }
 
             JPH::BodyCreationSettings BCS(
@@ -1223,6 +1317,8 @@ static void refreshCaptures(
     const auto FOCUSED = Compat::focusedWindow();
     const std::uintptr_t FOCUSED_ID = FOCUSED ? Compat::windowId(FOCUSED) : 0;
 
+    bool consumedSkirt = false;
+
     for (const auto& info : infos) {
         // Focus-change feedback (the active/inactive opacity fade and the
         // border color tween) is compositor-side -- no client commit happens,
@@ -1272,11 +1368,24 @@ static void refreshCaptures(
             (g_resize.active && g_resize.id == info.id) ||
             info.id == FOCUSED_ID;
 
+        bool consumedSkirt = false;
+
+        // The frame after a resize gesture ended: one forced snapshot, whose
+        // only purpose is the settled full-resolution silhouette refresh.
+        bool finalSkirt = false;
+        if (info.id == g_skirtFinalRefreshId) {
+            finalSkirt = true;
+            consumedSkirt = true;
+        }
+
         if (info.isLayer)
-            g_capture.makeSnapshotLayer(info.layer, mon, FORCE);
+            g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
         else
-            g_capture.makeSnapshot(info.window, mon, FORCE);
+            g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
     }
+
+    if (consumedSkirt)
+        g_skirtFinalRefreshId = 0;
 
     ++g_captureFrames;
 }
@@ -1373,6 +1482,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // frame -- see serviceCapture().
     const auto INFOS = Compat::enumerateEligibleWindows(mon);
 
+    g_winOutlines.clear();
+
     const float MONW = mon->m_size.x;
     const float MONH = mon->m_size.y;
 
@@ -1380,6 +1491,43 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     std::vector<World3D::SEntity> ENTITIES;
     ENTITIES.reserve(INFOS.size());
+
+    // Windows new to the room in this rebuild -- all of them when the view
+    // is turned on, except those with a remembered pose from an earlier
+    // session (g_rememberedPoses) -- stand side by side on an arc around the camera at the
+    // spawn distance, in the order the 2D layout had them, left to right
+    // (then top to bottom). All at the one spawn point, they covered each
+    // other and the room showed a single panel. One alone still spawns
+    // straight ahead. Each slot's angle is the arc length of the windows
+    // before it over the radius, with a gap between neighbours.
+    std::unordered_map<std::uintptr_t, float> freshAngle;
+    {
+        std::vector<const Compat::SWindowInfo*> FRESH;
+        for (const auto& info : INFOS)
+            if (!info.isLayer && !g_world.find(info.id) && !rememberedPose(info))
+                FRESH.push_back(&info);
+
+        if (FRESH.size() > 1) {
+            std::sort(FRESH.begin(), FRESH.end(), [](const auto* a, const auto* b) {
+                if (a->monitorLocalBox.x != b->monitorLocalBox.x)
+                    return a->monitorLocalBox.x < b->monitorLocalBox.x;
+                return a->monitorLocalBox.y < b->monitorLocalBox.y;
+            });
+
+            const float RADIUS = std::max(g_cfgSpawnDistance, 0.5f);
+            const float GAP    = World3D::toWorld(48.0f) * WIN_SCALE;
+            float       total  = GAP * static_cast<float>(FRESH.size() - 1);
+            for (const auto* f : FRESH)
+                total += World3D::toWorld(f->monitorLocalBox.w) * WIN_SCALE;
+
+            float along = -total * 0.5f;
+            for (const auto* f : FRESH) {
+                const float W = World3D::toWorld(f->monitorLocalBox.w) * WIN_SCALE;
+                freshAngle[f->id] = (along + W * 0.5f) / RADIUS;
+                along += W + GAP;
+            }
+        }
+    }
 
     for (const auto& info : INFOS) {
         // Track each window's last stable (non-transition) box -- see
@@ -1431,6 +1579,34 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.surfaceWidth   = SNAPSHOT->surfaceSize.x;
         entity.surfaceHeight  = SNAPSHOT->surfaceSize.y;
 
+        // Depth-slab FALLBACK silhouette for WINDOWS: an analytic rounded
+        // rectangle of the decorated box -- the corner radius the compositor
+        // reports plus the border inset. Used only when the texture-traced
+        // outline is unavailable (the GPU copy failed or found no shape);
+        // the primary source lives in the capture layer.
+        if (!info.isLayer && info.window) {
+            const float R = std::max(
+                0.0f, info.window->rounding() +
+                          static_cast<float>(SNAPSHOT->surfaceOffset.x));
+
+            auto& C = g_winOutlines[info.id];
+
+            if (!C.loops || C.w != static_cast<int>(BOX.w) ||
+                C.h != static_cast<int>(BOX.h) || C.r != static_cast<int>(R)) {
+                C.w = static_cast<int>(BOX.w);
+                C.h = static_cast<int>(BOX.h);
+                C.r = static_cast<int>(R);
+
+                SOutlineLoop LOOP =
+                    roundedRectLoop(BOX.w, BOX.h, R, 3.0f, 10);
+
+                C.loops = std::make_shared<const std::vector<SOutlineLoop>>(
+                    LOOP.pts.size() >= 3
+                        ? std::vector<SOutlineLoop>{std::move(LOOP)}
+                        : std::vector<SOutlineLoop>{});
+            }
+        }
+
         // Uniform window scale from config, applied to every entity every
         // frame so a runtime change resizes the whole room. The scale is
         // uniform so the captured content never distorts.
@@ -1454,7 +1630,14 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         }
         else {
             const auto& CAM = g_scene.camera();
-            const Vec3 FWD = CAM.forward();
+            Vec3 FWD = CAM.forward();
+
+            // Its slot on the arc (see freshAngle): turned about the
+            // camera's up, to the right for a positive angle.
+            if (const auto SLOT = freshAngle.find(info.id); SLOT != freshAngle.end()) {
+                const Vec3 RIGHT = CAM.right();
+                FWD = normalize(FWD * std::cos(SLOT->second) + RIGHT * std::sin(SLOT->second));
+            }
 
             entity.center = CAM.position + FWD * g_cfgSpawnDistance;
 
@@ -1563,6 +1746,20 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             (LAST_FS_WIN && entity.id == Compat::windowId(LAST_FS_WIN));
 
         render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
+
+        // Depth slab (windows.depth): silhouette source priority -- the
+        // outline traced from the snapshot texture's real alpha (exact
+        // corner shape; the GPU-side copy is the only reliable read), then
+        // the analytic rounded rect (mask refresh failures, first frames),
+        // then GLScene's plain box.
+        render.depth = g_cfgWindowDepth;
+
+        if (SNAPSHOT->outlines && !SNAPSHOT->outlines->empty())
+            render.outlines = SNAPSHOT->outlines;
+        else if (auto IT = g_winOutlines.find(entity.id);
+                 IT != g_winOutlines.end() && IT->second.loops &&
+                 !IT->second.loops->empty())
+            render.outlines = IT->second.loops;
 
         // The snapshot framebuffer covers the whole monitor, so the window is
         // a subrect of it. Hyprland renders its framebuffers with logical Y
@@ -2315,6 +2512,13 @@ static void resetPointerGesture() {
     g_pointerDown = false;
     g_pointerGesture = EPointerGesture::None;
     g_pointerButton = 0;
+
+    // A finished resize gesture: schedule one forced snapshot of the resized
+    // window for the next capture pass -- its purpose is the silhouette's
+    // settled full-resolution refresh (see CWindowCapture::refreshSkirtMask).
+    if (g_resize.active)
+        g_skirtFinalRefreshId = g_resize.id;
+
     g_resize = {};
     // A finished roll gesture restores the object's gravity.
     endModelRoll();
@@ -2600,6 +2804,10 @@ static void enter3D() {
     resetMovementKeys();
 
     g_grounded = false;
+    g_viewMode = 0;
+    g_scene.camera().mirrorView = false;
+    g_scene.setPlayerVisible(false);
+    g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
     g_scene.setCrosshairVisible(true);
@@ -2848,7 +3056,11 @@ static void update3D(float dt) {
     const auto JOLT_T0 = std::chrono::steady_clock::now();
     joltSyncBodies();
 
-    if (g_joltSystem) {
+    // While a scene object is still being decoded, or its first shape
+    // cooked, its collision is missing: the player and every prop would fall
+    // through a map that is not there yet. Time stands still until it is --
+    // as it did while the load froze the whole compositor.
+    if (g_joltSystem && !g_scene.scenePending() && !joltShapesPending()) {
         // All jobs execute on the main thread (0 workers), but through the
         // FULL thread-pool job system: it handles the dependency graph of
         // PhysicsSystem::Update, unlike JobSystemSingleThreaded, which
@@ -2893,24 +3105,56 @@ static void update3D(float dt) {
             }
         }
 
-        // Player readback: the camera rides the body's eye point (the body
-        // owns the pose now). While a fullscreen transition animates
-        // (To2D/To3D) the transition owns the camera; its end pose resyncs
-        // the body on the first normal frame. (g_transition is the ROOM
-        // progress -- 1.0 in normal 3D -- it must NOT gate this.)
+        // Player readback: the camera derives from the body's eye point --
+        // first person, or third person behind/front (F5) along the look
+        // axes (the front view looks back at the character). While a
+        // fullscreen transition animates the transition owns the camera.
+        // (g_transition is the ROOM progress -- 1.0 in normal 3D -- it must
+        // NOT gate this.)
         if (!g_playerBody.IsInvalid()) {
-            if (g_fsPhase == EFullscreenPhase::None) {
-                const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
-                const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
-                               PPOS.GetZ()};
-                auto& CAM = g_scene.camera();
+            const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+            const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
+                           PPOS.GetZ()};
+            auto& CAM = g_scene.camera();
+
+            if (g_fsPhase == EFullscreenPhase::None && g_viewMode == 0) {
+                // First person: the camera IS the eye. The third-person
+                // orbit is applied AFTER this frame's look update (see the
+                // movement block) -- computing it here would position the
+                // camera by the OLD yaw while the view points by the NEW
+                // one, and the whole world would step on every turn.
                 if (EYE.x != CAM.position.x || EYE.y != CAM.position.y ||
                     EYE.z != CAM.position.z) {
                     CAM.position = EYE;
                     damageCurrentMonitor();
                 }
             }
+            CAM.mirrorView = g_viewMode == 2;
+
             g_grounded = playerGrounded();
+
+            // The character renders in third person only; F3 adds the
+            // capsule outline.
+            g_scene.setPlayerVisible(g_viewMode != 0);
+            g_scene.setPlayerDebugCapsule(
+                Vec3{PPOS.GetX(), PPOS.GetY(), PPOS.GetZ()}, g_debugHud);
+
+            // Character state: air = jump (plays once and holds), grounded =
+            // walk/run by horizontal speed, else idle. The POSE (the facing)
+            // is applied after this frame's look update below -- applying it
+            // here would render the model one camera-frame behind, stepping
+            // after the mouse on every turn.
+            if (g_scene.player()->loaded()) {
+                const auto VEL = g_bodyIf->GetLinearVelocity(g_playerBody);
+                const float HSP = std::sqrt(VEL.GetX() * VEL.GetX() +
+                                            VEL.GetZ() * VEL.GetZ());
+                const auto ST = !g_grounded
+                    ? CPlayerModel::EState::Jump
+                    : HSP > 0.4f ? (g_keySprint ? CPlayerModel::EState::Run
+                                                : CPlayerModel::EState::Walk)
+                                 : CPlayerModel::EState::Idle;
+                g_scene.player()->setState(ST);
+            }
         }
 
         g_msJolt = g_msJolt * 0.9 +
@@ -2969,11 +3213,18 @@ static void update3D(float dt) {
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
 
+        // collision = false: the capsule joins no contact pair at all --
+        // it flies/falls through everything (the honest noclip).
+        g_bodyIf->SetObjectLayer(
+            g_playerBody,
+            g_playerCollision ? LAYER_MOVING : LAYER_GRABBED);
+
         // The camera was moved by something else (spawn reset, fullscreen
         // transition handoff): teleport the body under it. Skipped while a
         // transition animates (To2D/To3D own the camera then); the
-        // transition's end pose resyncs on the first normal frame.
-        if (g_fsPhase == EFullscreenPhase::None) {
+        // transition's end pose resyncs on the first normal frame. First
+        // person only: in third person the camera is DERIVED from the body.
+        if (g_fsPhase == EFullscreenPhase::None && g_viewMode == 0) {
             const auto CUR = g_bodyIf->GetPosition(g_playerBody);
             const float DX = CAM.position.x - CUR.GetX();
             const float DY = CAM.position.y - (CUR.GetY() + PLAYER_EYE_OFF);
@@ -2995,6 +3246,71 @@ static void update3D(float dt) {
             g_bodyIf->SetObjectLayer(g_playerBody, WANT_LAYER);
 
         applyCameraMovement(dt); // -> s_moveVel
+
+        // The character's facing: RY(pi - yaw) maps the authored +Z front
+        // onto the look direction. Applied AFTER this frame's look update
+        // and assigned DIRECTLY -- any smoothing here is second-order on
+        // top of the look inertia and reads as a staircase on fast turns.
+        {
+            const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+            g_scene.setPlayerPose(
+                Vec3{PPOS.GetX(), PPOS.GetY() - Camera::kBodyHeight * 0.5f,
+                     PPOS.GetZ()},
+                3.14159265f - CAM.yaw);
+
+            // The third-person camera SPHERICALLY orbits the player: yaw
+            // sweeps the horizontal ring, pitch lifts/drops the camera
+            // around the anchor (behind on 0 pitch, above on negative,
+            // below on positive), at the same eye level as first person on
+            // the zero pitch. Collision-aware: a ray from the head toward
+            // the orbit position pulls the camera in front of walls.
+            if (g_viewMode != 0) {
+                const Vec3 ORBIT_EYE{PPOS.GetX(),
+                                     PPOS.GetY() + PLAYER_EYE_OFF,
+                                     PPOS.GetZ()};
+                const Vec3 FLAT = CAM.flatForward();
+                const float P = CAM.pitch;
+                Vec3 DIR =
+                    FLAT * (-std::cos(P)) + Vec3{0.f, 1.f, 0.f} * (-std::sin(P));
+                if (g_viewMode == 2)
+                    DIR.x *= -1.f, DIR.y *= -1.f, DIR.z *= -1.f;
+
+                // The distance glides toward the full orbit radius, but is
+                // CLAMPED by the ray each frame: the ray probes the FULL
+                // orbit distance, and the camera never sits beyond the hit
+                // (a hand's width before the wall). Turning changes the hit
+                // distance gradually, so the camera slides along walls; the
+                // pop-out glides; the push-in can never cross.
+                g_playerCamDist += (kThirdDist - g_playerCamDist) *
+                    (1.0f - std::exp(-8.0f * dt));
+
+                if (kThirdDist > 1e-4f) {
+                    const JPH::RRayCast RAY{
+                        JPH::RVec3(ORBIT_EYE.x, ORBIT_EYE.y, ORBIT_EYE.z),
+                        JPH::Vec3(DIR.x * kThirdDist, DIR.y * kThirdDist,
+                                  DIR.z * kThirdDist)};
+                    JPH::RayCastResult HIT;
+                    const JPH::IgnoreSingleBodyFilter SKIP_SELF(g_playerBody);
+                    if (g_joltSystem->GetNarrowPhaseQuery().CastRay(
+                            RAY, HIT, JPH::BroadPhaseLayerFilter(),
+                            JPH::ObjectLayerFilter(), SKIP_SELF)) {
+                        g_playerCamDist = std::min(
+                            g_playerCamDist,
+                            std::max(0.05f,
+                                     HIT.mFraction * kThirdDist - 0.15f));
+                    }
+                }
+                g_playerCamDist = std::max(g_playerCamDist, 0.05f);
+
+                const Vec3 WANT = ORBIT_EYE + DIR * g_playerCamDist;
+
+                if (WANT.x != CAM.position.x || WANT.y != CAM.position.y ||
+                    WANT.z != CAM.position.z) {
+                    CAM.position = WANT;
+                    damageCurrentMonitor();
+                }
+            }
+        }
 
         // Flying: all three axes key-driven, gravity asleep. Walking: the
         // keys own the horizontal plane, Jolt's gravity the vertical one.
@@ -3028,7 +3344,7 @@ static void update3D(float dt) {
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
         const bool BOBING = g_cfgWalkBob && !playerFlies() && g_grounded &&
-            g_fsPhase == EFullscreenPhase::None;
+            g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
         const float TARGET_AMP =
             BOBING ? kBobAmplitude *
                 std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
@@ -3446,6 +3762,30 @@ static void dumpStatus() {
         out << "scenePixel=unavailable\n";
 
     out << "renderWindows=" << g_renderWindows.size() << "\n";
+
+    // Window-depth pipeline trace: the configured thickness and the
+    // silhouette each window draws its walls from (windows: traced from the
+    // snapshot texture via the GPU copy, fallback analytic; layers: traced
+    // from the picking mask). skirt=0/err=N says the copy failed and why.
+    for (const auto& RW : g_renderWindows) {
+        out << "  rwin=" << RW.id << " depth=" << RW.depth
+            << " outlines=" << (RW.outlines ? (long)RW.outlines->size() : -1);
+
+        if (RW.outlines && !RW.outlines->empty()) {
+            const auto& L = (*RW.outlines)[0];
+            out << " pts=" << L.pts.size();
+            if (!L.pts.empty())
+                out << " p0=" << L.pts[0].x << "," << L.pts[0].y;
+        }
+
+        if (const auto* SN = g_capture.get(RW.id))
+            out << " skirt=" << (SN->skirtValid ? 1 : 0)
+                << " err=" << SN->skirtError
+                << " mask=" << SN->skirtW << "x" << SN->skirtH;
+
+        out << "\n";
+    }
+
     out << "renderGate=" << (g_lastRenderGate.empty() ? "none" : g_lastRenderGate)
         << "\n";
     out << "renderer=" << (g_pHyprRenderer ? "ok" : "NULL")
@@ -4863,6 +5203,15 @@ static void onKeyboardKey(
         return;
     }
 
+    // F5: cycle the view -- first person, third person behind, third
+    // person in front.
+    if (PRESSED && SYM == XKB_KEY_F5) {
+        g_viewMode = (g_viewMode + 1) % 3;
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     if (SYM == XKB_KEY_c) {
         // View zoom: hold to magnify, release to ease back to 1x. The
         // wheel level restarts at the base on every press.
@@ -4893,6 +5242,10 @@ static int luaConfig(lua_State* L) {
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
     //         spawn_distance = 5.0,         -- units in front of the camera
+    //         depth = 0.05,                 -- window slab thickness, world
+    //                                       -- units (0 = flat quads; walls
+    //                                       -- follow rounded corners and
+    //                                       -- show the texture's edge)
     //     },
     //     player = {
     //         look_sensitivity = 0.0025,    -- radians per pointer count
@@ -4918,7 +5271,7 @@ static int luaConfig(lua_State* L) {
     // })
     //
     // Missing keys keep their current value; wrong-typed keys raise a lua
-    // error. Numbers are clamped on set.
+    // error.
     if (!lua_istable(L, 1))
         return luaL_error(L, "hypr3d.config expects a single table");
 
@@ -5072,6 +5425,14 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: windows.spawn_height must be a number");
         g_cfgSpawnWidth  = std::max(g_cfgSpawnWidth, 100.0f);
         g_cfgSpawnHeight = std::max(g_cfgSpawnHeight, 100.0f);
+        if (!SET_NUM(idx, "depth", g_cfgWindowDepth,
+                     "windows.depth"))
+            return luaL_error(L, "hypr3d.config: windows.depth must be a number");
+
+        // Thickness is a distance: 0 (the default) draws the flat quads,
+        // anything below is clamped up to it.
+        g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
+
         lua_pop(L, 1);
     }
 
@@ -5097,6 +5458,174 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.noclip must be a boolean");
         if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
+        if (!SET_BOOL(idx, "collision", g_playerCollision, "player.collision"))
+            return luaL_error(L, "hypr3d.config: player.collision must be a boolean");
+
+        // The shared mesh-block parser: path + transform + material
+        // overrides -- the SAME description for the player and the scene
+        // objects. transform.position anchors the mesh, rotation.y corrects
+        // the authored facing, scale stretches it.
+        const auto PARSE_MESH = [&](int MT, std::string& path, Vec3& pos,
+                                    Vec3& rotDeg, Vec3& scale,
+                                    float& emissive, bool& flat,
+                                    std::string& center,
+                                    Vec3& centerOff) -> bool {
+            if (!SET_STRING(MT, "path", path, "mesh.path"))
+                return false;
+
+            lua_getfield(L, MT, "transform");
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+            } else if (!lua_istable(L, -1)) {
+                lua_pop(L, 1);
+                return false;
+            } else {
+                const int TIDX = lua_gettop(L);
+                if (!SET_VEC3(TIDX, "position", pos, "mesh.transform.position") ||
+                    !SET_VEC3(TIDX, "rotation", rotDeg, "mesh.transform.rotation") ||
+                    !SET_VEC3(TIDX, "scale", scale, "mesh.transform.scale"))
+                    return false;
+                lua_pop(L, 1);
+            }
+
+            if (!SET_NUM(MT, "emissive_scale", emissive, "mesh.emissive_scale") ||
+                !SET_BOOL(MT, "flat", flat, "mesh.flat") ||
+                !SET_STRING(MT, "center", center, "mesh.center") ||
+                !SET_VEC3(MT, "center_offset", centerOff, "mesh.center_offset"))
+                return false;
+            return true;
+        };
+
+        // player.mesh: the character's visual, described exactly like a
+        // scene object's mesh. The transform.position anchors the model
+        // relative to the feet, rotation.y corrects the authored facing.
+        lua_getfield(L, idx, "mesh");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.mesh must be a table");
+        } else {
+            const int MT = lua_gettop(L);
+            if (!PARSE_MESH(MT, g_playerCfg.path, g_playerCfg.posOffset,
+                            g_playerCfg.rotDeg, g_playerCfg.scale,
+                            g_playerCfg.emissiveScale, g_playerCfg.flat,
+                            g_playerCfg.center, g_playerCfg.centerOffset))
+                return luaL_error(L, "hypr3d.config: player.mesh is invalid");
+            lua_pop(L, 1);
+        }
+
+        // Legacy single keys, kept as a fallback for older configs. Applied
+        // ONLY when the key is actually present: model_scale used to rebuild
+        // the scale as {x, x, x} on every parse, silently collapsing the
+        // mesh block's per-axis transform.scale.
+        lua_getfield(L, idx, "model");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            if (!SET_STRING(idx, "model", g_playerCfg.path, "player.model"))
+                return luaL_error(L, "hypr3d.config: player.model must be a string");
+        } else {
+            lua_pop(L, 1);
+        }
+        lua_getfield(L, idx, "model_scale");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            float SCALE_F = g_playerCfg.scale.x;
+            if (!SET_NUM(idx, "model_scale", SCALE_F, "player.model_scale"))
+                return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
+            g_playerCfg.scale = Vec3{SCALE_F, SCALE_F, SCALE_F};
+        } else {
+            lua_pop(L, 1);
+        }
+        lua_getfield(L, idx, "model_turn");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            if (!SET_NUM(idx, "model_turn", g_playerCfg.rotDeg.y, "player.model_turn"))
+                return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
+        } else {
+            lua_pop(L, 1);
+        }
+
+        const auto SET_ANIM = [&](const char* key, int slot) -> bool {
+            lua_getfield(L, idx, key);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                return true;
+            }
+            if (lua_isnumber(L, -1)) {
+                g_playerCfg.animIdx[slot] = static_cast<int>(lua_tonumber(L, -1));
+                g_playerCfg.animName[slot].clear();
+            } else if (lua_isstring(L, -1)) {
+                size_t LEN = 0;
+                const char* STR = lua_tolstring(L, -1, &LEN);
+                g_playerCfg.animName[slot].assign(STR, LEN);
+                g_playerCfg.animIdx[slot] = -1;
+            } else {
+                lua_pop(L, 1);
+                return false;
+            }
+            lua_pop(L, 1);
+            return true;
+        };
+        if (!SET_ANIM("anim_idle", 0) || !SET_ANIM("anim_walk", 1) ||
+            !SET_ANIM("anim_run", 2) || !SET_ANIM("anim_jump", 3))
+            return luaL_error(L, "hypr3d.config: player.anim_* must be an animation index or name");
+
+        // animations = { idle = {source = "Idle" | 0, duration_scale = 1.0},
+        //                ... } -- source is a clip name or an index;
+        // duration_scale is the playback SPEED multiplier (1 = as authored).
+        static const char* const STATE_KEYS[4] = {"idle", "walk", "run", "jump"};
+        lua_getfield(L, idx, "animations");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.animations must be a table");
+        } else {
+            const int AT = lua_gettop(L);
+            for (int slot = 0; slot < 4; ++slot) {
+                lua_getfield(L, AT, STATE_KEYS[slot]);
+                if (lua_isnil(L, -1)) {
+                    lua_pop(L, 1);
+                    continue;
+                }
+                if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.%s must be a table",
+                        STATE_KEYS[slot]);
+                }
+                const int ST = lua_gettop(L);
+
+                lua_getfield(L, ST, "source");
+                if (lua_isnumber(L, -1)) {
+                    g_playerCfg.animIdx[slot] = static_cast<int>(lua_tonumber(L, -1));
+                    g_playerCfg.animName[slot].clear();
+                } else if (lua_isstring(L, -1)) {
+                    size_t LEN = 0;
+                    const char* STR = lua_tolstring(L, -1, &LEN);
+                    g_playerCfg.animName[slot].assign(STR, LEN);
+                    g_playerCfg.animIdx[slot] = -1;
+                } else {
+                    lua_pop(L, 2);
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.%s.source must be a clip name or index",
+                        STATE_KEYS[slot]);
+                }
+                lua_pop(L, 1); // source
+
+                float SPEED = 1.0f;
+                if (!SET_NUM(ST, "duration_scale", SPEED,
+                             "player.animations.<state>.duration_scale"))
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.<state>.duration_scale must be a number");
+                g_playerAnimSpeed[slot] = SPEED;
+                g_playerCfg.animSpeed[slot] = SPEED;
+
+                lua_pop(L, 1); // the state table
+            }
+            lua_pop(L, 1); // animations
+        }
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
         lua_pop(L, 1);
@@ -5212,6 +5741,47 @@ static int luaConfig(lua_State* L) {
                 return luaL_error(L, "hypr3d.config: scene.<name>.center_offset must be a table { x = .., y = .., z = .. }");
             }
 
+            // mesh = { ... }: the shared visual description -- overrides
+            // the legacy flat keys when present.
+            lua_getfield(L, OIDX, "mesh");
+            if (lua_istable(L, -1)) {
+                const int MT = lua_gettop(L);
+                std::string CENTER = "origin";
+                Vec3 MROT{};
+                bool MFLAT = OBJ.flat;
+                float MEMIS = OBJ.emissiveScale;
+                if (!SET_STRING(MT, "path", OBJ.path, "mesh.path") ||
+                    !SET_VEC3(MT, "center_offset", OBJ.centerOffset,
+                              "mesh.center_offset") ||
+                    !SET_NUM(MT, "emissive_scale", MEMIS, "mesh.emissive_scale") ||
+                    !SET_BOOL(MT, "flat", MFLAT, "mesh.flat") ||
+                    !SET_STRING(MT, "center", CENTER, "mesh.center"))
+                    return luaL_error(L, "hypr3d.config: scene.<name>.mesh is invalid");
+                OBJ.emissiveScale = MEMIS;
+                OBJ.flat = MFLAT;
+                OBJ.center = CENTER == "origin"
+                    ? CMapModel::ECenter::Origin : CMapModel::ECenter::Logical;
+
+                lua_getfield(L, MT, "transform");
+                if (lua_isnil(L, -1)) {
+                    lua_pop(L, 1);
+                } else if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "hypr3d.config: scene.<name>.mesh.transform must be a table");
+                } else {
+                    const int TIDX = lua_gettop(L);
+                    if (!SET_VEC3(TIDX, "position", OBJ.position,
+                                  "mesh.transform.position") ||
+                        !SET_VEC3(TIDX, "rotation", OBJ.rotationDeg,
+                                  "mesh.transform.rotation") ||
+                        !SET_VEC3(TIDX, "scale", OBJ.scale,
+                                  "mesh.transform.scale"))
+                        return luaL_error(L, "hypr3d.config: scene.<name>.mesh.transform is invalid");
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1); // pop mesh (or its nil)
+
             OBJECTS.push_back(OBJ);
             lua_pop(L, 1); // pop the value; the key remains for lua_next
         }
@@ -5278,6 +5848,11 @@ static int luaConfig(lua_State* L) {
         g_sceneObjects = std::move(OBJECTS);
         lua_pop(L, 1);
     }
+
+    g_scene.setPlayerConfig(g_playerCfg);
+    for (int slot = 0; slot < 4; ++slot)
+        g_scene.player()->setAnimSpeed(static_cast<CPlayerModel::EState>(slot),
+                                       g_playerAnimSpeed[slot]);
 
     return 0;
 }
@@ -5474,6 +6049,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Hyprland keeps the last frame's pass elements until the next
+    // beginRender() clears them -- ours included. After dlclose() that clear()
+    // ran the destructor of a CHypr3DPassElement whose code was gone: unloading
+    // while the 3D view was on crashed Hyprland (SIGSEGV in
+    // IHyprRenderer::beginRender, measured on 0.56.2). `hyprctl plugin unload`
+    // calls this from the event loop, between frames, so the element is done.
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->m_renderPass.removeAllOfType("Hypr3D");
+
     if (g_deactivateLater && g_pEventLoopManager)
         g_pEventLoopManager->removeDoLater(g_deactivateLater);
     g_deactivateLater = 0;

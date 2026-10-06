@@ -2,9 +2,26 @@ cmake_minimum_required(VERSION 3.27)
 
 project(hypr3d LANGUAGES CXX)
 
+# hyprpm and the README run cmake without a build type, which compiled the
+# plugin's own code unoptimised (-O0, only Jolt had -O2); the official
+# hyprland-plugins build with CXXFLAGS ?= -O2. Loading Khronos' FlightHelmet
+# held one frame ~260 ms at -O0 and ~60 ms at -O2 (VM, virgl). A packager's
+# own build type (makepkg: None) is kept.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# No STB_GNU_UNIQUE symbols: one of them makes glibc refuse to unload the
+# library (it is marked NODELETE), so `hyprctl plugin unload` left it mapped
+# and the next `plugin load` ran PLUGIN_INIT again on the old, already shut
+# down state -- turning the view on then crashed Hyprland (SIGSEGV, measured
+# on Hyprland 0.56.2; 162 such symbols came from Hyprland's headers). For
+# every target, Jolt included.
+add_compile_options(-fno-gnu-unique)
 
 set(HYPRLAND_HEADERS "" CACHE PATH
     "Hyprland headers root containing include/hyprland"
@@ -85,13 +102,16 @@ pkg_check_modules(PIXMAN REQUIRED IMPORTED_TARGET pixman-1)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
+pkg_check_modules(TURBOJPEG REQUIRED IMPORTED_TARGET libturbojpeg)
 
 add_library(hypr3d SHARED
     src/main.cpp
     src/Render/GLScene.cpp
     src/Render/MapModel.cpp
+    src/Render/PlayerModel.cpp
     src/World/MapCollision.cpp
     src/World/Camera.cpp
+    src/World/Outline.cpp
     src/World/Picking.cpp
     src/World/World3D.cpp
     src/Input/InputController.cpp
@@ -112,6 +132,7 @@ target_include_directories(hypr3d
 
 target_link_libraries(hypr3d PRIVATE
     PkgConfig::HYPRGRAPHICS
+    PkgConfig::TURBOJPEG
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
     PkgConfig::XKBCOMMON

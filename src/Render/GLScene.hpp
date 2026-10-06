@@ -1,7 +1,9 @@
 #pragma once
 
 #include "Render/MapModel.hpp"
+#include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
+#include "World/Outline.hpp"
 #include "World/Picking.hpp"
 
 #include <cstdint>
@@ -46,6 +48,15 @@ class GLScene {
         float u0 = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
 
         float alpha = 1.0f;
+
+        // Depth slab: thickness in world units, extruded BACKWARDS along the
+        // window's normal (0 = the plain flat quad). When `outlines` carries
+        // the captured alpha's silhouette, the slab's walls hug that shape --
+        // rounded corners stay rounded -- and each wall samples its own
+        // silhouette texel, so the window texture's edge colors paint the
+        // sides. Without an outline the slab is a plain box.
+        float depth = 0.0f;
+        std::shared_ptr<const std::vector<SOutlineLoop>> outlines;
     };
 
     GLScene();
@@ -132,10 +143,54 @@ class GLScene {
     }
 
     // The base grid platform (world zero): visible + collidable.
+    // F3 debug: the player's collision capsule outline (world space).
+    void setPlayerDebugCapsule(const Vec3& center, bool on) {
+        m_pDbgCenter = center;
+        m_pDbgOn     = on;
+    }
+
     // View zoom (the C key): magnification narrows the render fov
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
         m_zoom = magnification > 0.01f ? magnification : 0.01f;
+    }
+
+    // The player's own character (player.mesh). The SAME mesh description
+    // the scene objects use: path, transform, material overrides. Config
+    // and pose come from main; the animation clock runs inside render().
+    struct SPlayerCfg {
+        std::string path;
+        Vec3        posOffset{};   // model anchor offset from the feet
+        Vec3        rotDeg{};      // authored facing correction, XYZ degrees
+        Vec3        scale{1.f, 1.f, 1.f};
+        float       emissiveScale = 1.0f;
+        bool        flat = false;  // true: raw texture, no headlight shading
+        std::string center;       // parsed for format parity; the player
+        Vec3        centerOffset{}; // rotates around its anchor, so only
+                                  // center_offset (the anchor shift) applies
+        // idle, walk, run, jump: animation index or name (name wins),
+        // plus the playback speed multiplier (1 = as authored).
+        int         animIdx[CPlayerModel::kStateCount] = {-1, -1, -1, -1};
+        std::string animName[CPlayerModel::kStateCount];
+        float       animSpeed[CPlayerModel::kStateCount] = {1.f, 1.f, 1.f, 1.f};
+    };
+
+    void setPlayerConfig(const SPlayerCfg& cfg) {
+        m_playerCfg = cfg;
+        m_playerPath.clear(); // forces a (re)load attempt
+    }
+
+    void setPlayerPose(const Vec3& feet, float yawRad) {
+        m_playerFeet = feet;
+        m_playerYaw  = yawRad;
+    }
+
+    void setPlayerVisible(bool on) {
+        m_playerVisible = on;
+    }
+
+    CPlayerModel* player() {
+        return &m_player;
     }
 
     void setGridVisible(bool on) {
@@ -149,7 +204,7 @@ class GLScene {
         std::string path;
         Vec3 position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
         float emissiveScale = 1.0f;
-        bool flat = true;
+        bool flat = false; // false = headlight half-lambert shading
         CMapModel::ECenter center = CMapModel::ECenter::Logical;
         Vec3 centerOffset{};
     };
@@ -168,6 +223,15 @@ class GLScene {
 
     CMapModel* sceneModel(size_t index) {
         return index < m_slots.size() ? m_slots[index].model.get() : nullptr;
+    }
+
+    // A scene object is still being read and decoded, so its collision is
+    // not there yet.
+    bool scenePending() const {
+        for (const auto& S : m_slots)
+            if (S.model && S.model->pending())
+                return true;
+        return false;
     }
 
     // Move/rotate a (grabbed) object: updates the slot spec and the model
@@ -196,6 +260,7 @@ class GLScene {
     bool ensureSceneFramebuffer(int width, int height);
 
     void refreshScene();
+    void refreshPlayer();
 
     void drawDebugOverlay(int width, int height);
 
@@ -301,6 +366,21 @@ class GLScene {
     SPointer                        m_pointer;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
+    CPlayerModel                    m_player;
+    // Player debug capsule (F3).
+    unsigned int                    m_pDbgProgram = 0, m_pDbgVAO = 0, m_pDbgVBO = 0;
+    int                             m_pDbgMVP = -1;
+    int                             m_pDbgVerts = 0;
+    bool                            m_pDbgOn = false;
+    Vec3                            m_pDbgCenter{};
+    void drawPlayerDebugCapsule(const Mat4& vp);
+    SPlayerCfg                      m_playerCfg;
+    std::string                     m_playerPath;      // tilde-expanded
+    std::filesystem::file_time_type m_playerMtime{};
+    bool                            m_playerMtimeValid = false;
+    bool                            m_playerVisible    = false;
+    Vec3                            m_playerFeet{};
+    float                           m_playerYaw        = 0.f;
     float                           m_debugFps     = 0.f;
 
     unsigned int                    m_textVAO = 0, m_textVBO = 0;

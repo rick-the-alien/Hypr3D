@@ -2,18 +2,26 @@
 
 #include "World/Camera.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace H3D {
 
 // A glTF 2.0 map (.glb or .gltf) placed in the room: GL meshes, decoded
-// textures and world-space collision triangles. Owns its GL objects; load()
+// textures and world-space collision triangles. Owns its GL objects; poll()
 // and destroy() must run with the EGL context current (they are called from
-// GLScene::render, like the panorama refresh).
+// GLScene::render, like the panorama refresh). The file is read and decoded
+// on a worker thread.
 class CMapModel {
   public:
+    CMapModel();
+    ~CMapModel();
+
     // World-space triangle (the map transform is already applied). This is
     // what collision consumes.
     struct STL {
@@ -22,12 +30,26 @@ class CMapModel {
 
     enum class ECenter : uint8_t { Logical, Origin };
 
-    // rotationDeg is XYZ Euler angles in degrees. Re-loading with the same
-    // path and transform is a cheap no-op (mtime is NOT checked here -- the
-    // caller decides when the file changed).
+    // rotationDeg is XYZ Euler angles in degrees. Starts reading and
+    // decoding the file on a worker thread; poll() makes the GL objects once
+    // that is done. mtime is NOT checked here -- the caller decides when the
+    // file changed.
     bool load(const std::string& path, const Vec3& position,
               const Vec3& rotationDeg, const Vec3& scale);
+    // Finishes a load whose worker is done. Every frame, context current.
+    void poll();
     void destroy();
+
+    // A load is still being read and decoded, or its textures uploaded.
+    bool pending() const {
+        return m_worker.joinable() || m_uploading;
+    }
+
+    // The last load could not read the file; it is not retried until the
+    // caller loads again.
+    bool failed() const {
+        return m_failed;
+    }
 
     bool loaded() const {
         return m_loaded;
@@ -135,8 +157,14 @@ class CMapModel {
         Vec3         centroid{}; // node-space AABB center, for blend sorting
     };
 
-    unsigned int uploadTexture(const std::string& modelDir, const void* image,
-                               bool embedded, const void* data, size_t size);
+    // The file's meshes and images, read and decoded without GL.
+    struct SDecoded;
+    static std::unique_ptr<SDecoded> decode(const std::string& path,
+                                            std::stop_token stop);
+    void finishUpload();
+    void dropUpload();
+    void releaseMesh();
+    void stopWorker();
 
     std::vector<SPrimitive> m_primitives;
     std::vector<unsigned>   m_ownedTextures; // unique image textures
@@ -150,7 +178,7 @@ class CMapModel {
     Vec3                    m_centerOffset{};
     Vec3                    m_pivot{}; // resolved local pivot
     float                   m_emissiveScale = 1.0f;
-    bool                    m_flat = true;
+    bool                    m_flat = false; // false = headlight shading
     bool                    m_loaded = false;
     uint32_t                m_generation = 0;
     uint32_t                m_meshVersion = 0;
@@ -177,6 +205,17 @@ class CMapModel {
     int                     m_uFlat = -1;
     int                     m_uAlphaMode = -1;
     int                     m_uAlphaCutoff = -1;
+
+    std::string               m_meshPath; // the file the GL mesh came from
+    bool                      m_failed = false;
+    std::unique_ptr<SDecoded> m_decoded;  // the worker's result
+    // A decoded file whose textures go up one per frame, then its buffers.
+    std::unique_ptr<SDecoded> m_uploading;
+    std::vector<unsigned>     m_uploadTextures; // by image index, 0 = none
+    size_t                    m_uploadNext = 0;
+    std::atomic<bool>         m_decodedReady{false};
+    // Last, so it is destroyed -- joined -- before what its thread writes.
+    std::jthread              m_worker;
 };
 
 } // namespace H3D

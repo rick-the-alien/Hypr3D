@@ -188,7 +188,8 @@ Mat4 Camera::view() const {
     // up' = up*cos(r) + right*sin(r)).
     const Vec3 U = Vec3{0.f, 1.f, 0.f} * std::cos(roll) +
                    right() * std::sin(roll);
-    return Mat4::lookAt(position, position + forward(), U);
+    const Vec3 DIR = mirrorView ? forward() * -1.0f : forward();
+    return Mat4::lookAt(position, position + DIR, U);
 }
 
 } // namespace H3D

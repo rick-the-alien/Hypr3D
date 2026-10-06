@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 
 namespace H3D::Compat {
 
@@ -64,6 +65,275 @@ GLuint createBlankTexture(int width, int height) {
 
     glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
+}
+
+// --- GPU alpha copy ---------------------------------------------------------
+//
+// The snapshot framebuffer's alpha channel cannot be read back directly:
+// GPU sampling sees the real content opacity (windows render opaque with
+// transparent rounded corners), while glReadPixels on the snapshot FB
+// returns garbage in A -- the FB is backed by storage whose alpha bytes the
+// CPU-side read path does not see. The reliable path is therefore a GPU-side
+// copy: draw the snapshot texture into a small OWNED RGBA8 FBO with a plain
+// textured shader, then read that FBO back -- a standard path, the same one
+// GLScene's probe uses.
+
+struct SCopyGL {
+    GLuint prog = 0, vao = 0, vbo = 0;
+    int    uUVRect = -1, uTex = -1;
+};
+
+SCopyGL& copyGL() {
+    static SCopyGL C;
+    return C;
+}
+
+GLuint compileShader(GLenum type, const char* src) {
+    GLuint S = glCreateShader(type);
+    glShaderSource(S, 1, &src, nullptr);
+    glCompileShader(S);
+
+    GLint ok = GL_FALSE;
+    glGetShaderiv(S, GL_COMPILE_STATUS, &ok);
+
+    if (!ok) {
+        glDeleteShader(S);
+        return 0;
+    }
+
+    return S;
+}
+
+bool ensureCopyGL() {
+    auto& C = copyGL();
+
+    if (C.prog)
+        return true;
+
+    static constexpr const char* VS = R"GLSL(
+#version 300 es
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aUV;
+uniform vec4 uUVRect; // xy = subrect origin, zw = subrect size
+out vec2 vUV;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vUV = aUV * uUVRect.zw + uUVRect.xy;
+}
+)GLSL";
+
+    static constexpr const char* FS = R"GLSL(
+#version 300 es
+precision mediump float;
+in vec2 vUV;
+uniform sampler2D uTex;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(uTex, vUV);
+}
+)GLSL";
+
+    const GLuint VSx = compileShader(GL_VERTEX_SHADER, VS);
+    const GLuint FSx = compileShader(GL_FRAGMENT_SHADER, FS);
+
+    if (!VSx || !FSx) {
+        if (VSx) glDeleteShader(VSx);
+        if (FSx) glDeleteShader(FSx);
+        return false;
+    }
+
+    C.prog = glCreateProgram();
+    glAttachShader(C.prog, VSx);
+    glAttachShader(C.prog, FSx);
+    glLinkProgram(C.prog);
+    glDeleteShader(VSx);
+    glDeleteShader(FSx);
+
+    GLint ok = GL_FALSE;
+    glGetProgramiv(C.prog, GL_LINK_STATUS, &ok);
+
+    if (!ok) {
+        glDeleteProgram(C.prog);
+        C.prog = 0;
+        return false;
+    }
+
+    C.uUVRect = glGetUniformLocation(C.prog, "uUVRect");
+    C.uTex    = glGetUniformLocation(C.prog, "uTex");
+
+    // Fullscreen quad, UV (0,0) at the GL bottom-left: row 0 of the readback
+    // ends up being the subrect's v0 row.
+    static const float QUAD[] = {
+        -1.f, -1.f, 0.f, 0.f,   1.f, -1.f, 1.f, 0.f,   1.f, 1.f, 1.f, 1.f,
+        -1.f, -1.f, 0.f, 0.f,   1.f,  1.f, 1.f, 1.f,  -1.f, 1.f, 0.f, 1.f,
+    };
+
+    glGenVertexArrays(1, &C.vao);
+    glGenBuffers(1, &C.vbo);
+
+    glBindVertexArray(C.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, C.vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          reinterpret_cast<void*>(2 * sizeof(float)));
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    return true;
+}
+
+void shutdownCopyGL() {
+    auto& C = copyGL();
+
+    if (C.prog) glDeleteProgram(C.prog);
+    if (C.vao)  glDeleteVertexArrays(1, &C.vao);
+    if (C.vbo)  glDeleteBuffers(1, &C.vbo);
+
+    C = {};
+}
+
+// Draws `srcTex`'s UV subrect into a small owned FBO and returns the alpha
+// bytes. Returns 0 on success, else a diagnostic code.
+int copyTextureAlpha(GLuint srcTex, float u0, float v0, float u1, float v1,
+                     int mw, int mh, std::vector<unsigned char>& alphaOut) {
+    alphaOut.clear();
+
+    if (!srcTex || mw <= 0 || mh <= 0)
+        return 3;
+
+    if (!ensureCopyGL())
+        return 2;
+
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glGenFramebuffers(1, &fbo);
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mw, mh, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+
+    GLint oldDraw = 0, oldRead = 0, oldActive = 0, oldTex = 0;
+    GLint oldProg = 0, oldVAO = 0;
+    GLint oldViewport[4] = {};
+    GLboolean oldScissor = GL_FALSE, oldBlend = GL_FALSE,
+              oldDepth = GL_FALSE;
+
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActive);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVAO);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    oldScissor = glIsEnabled(GL_SCISSOR_TEST);
+    oldBlend   = glIsEnabled(GL_BLEND);
+    oldDepth   = glIsEnabled(GL_DEPTH_TEST);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex, 0);
+
+    int err = 0;
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        err = 2;
+    } else {
+        glViewport(0, 0, mw, mh);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, srcTex);
+
+        glUseProgram(copyGL().prog);
+        glUniform1i(copyGL().uTex, 0);
+        glUniform4f(copyGL().uUVRect, u0, v0, u1 - u0, v1 - v0);
+
+        glBindVertexArray(copyGL().vao);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+
+        err = glGetError() == GL_NO_ERROR ? 0 : 4;
+
+        if (err == 0) {
+            std::vector<unsigned char> rgba(static_cast<size_t>(mw) * mh * 4);
+            glReadPixels(0, 0, mw, mh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+
+            // Our own FBO: row 0 of the readback is the subrect's v0 row --
+            // for top-down snapshot textures v0 is the box's top row, the
+            // exact convention the outline tracer works with.
+            alphaOut.resize(static_cast<size_t>(mw) * mh);
+            for (size_t i = 0; i < alphaOut.size(); ++i)
+                alphaOut[i] = rgba[i * 4 + 3];
+        }
+    }
+
+    glActiveTexture(oldActive);
+    glBindTexture(GL_TEXTURE_2D, oldTex);
+    glUseProgram(oldProg);
+    glBindVertexArray(oldVAO);
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2],
+               oldViewport[3]);
+    if (oldScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (oldBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (oldDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDraw);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead);
+
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    return err;
+}
+
+// Trace + store the outline loops once the mask bytes are in. `insetTexels`
+// is the interior UV inset in MASK texels -- the caller computes it in
+// SOURCE pixels and scales by the mask resolution, so the sampling depth of
+// the walls is independent of how much the mask was downscaled. The outline
+// is owned by the per-window state (it must outlive this snapshot object)
+// and shared into it.
+void finishSkirtMask(CWindowCapture::SSkirtState& state,
+                     CWindowCapture::SSnapshot& snapshot,
+                     std::vector<unsigned char>&& alpha, int mw, int mh,
+                     float insetTexels, int boxW, int boxH) {
+    state.w    = mw;
+    state.h    = mh;
+    state.boxW = boxW;
+    state.boxH = boxH;
+    state.valid = true;
+
+    state.outlines =
+        std::make_shared<const std::vector<H3D::SOutlineLoop>>(
+            H3D::traceOutlines(alpha.data(), mw, mh, 64, insetTexels, 4, 128));
+
+    snapshot.outlines  = state.outlines;
+    snapshot.skirtW    = mw;
+    snapshot.skirtH    = mh;
+    snapshot.skirtValid = true;
+    snapshot.skirtError = 0;
+
+    // One-shot diagnosis dump (first successful refresh per plugin load):
+    // the alpha mask the wall silhouette was traced from.
+    static bool dumped = false;
+
+    if (!dumped) {
+        dumped = true;
+
+        std::ofstream M("/tmp/hypr3d-skirt-mask.pgm", std::ios::binary);
+        if (M) {
+            M << "P5\n" << mw << " " << mh << "\n255\n";
+            M.write(reinterpret_cast<const char*>(alpha.data()),
+                    static_cast<std::streamsize>(alpha.size()));
+        }
+    }
 }
 
 } // namespace
@@ -185,6 +455,8 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
         m_snapshots.erase(IT);
     }
     m_snapshots.emplace(ID, std::move(snapshot));
+
+    refreshSkirtMask(ID, m_snapshots.find(ID)->second, monitor);
 
     return true;
 }
@@ -325,7 +597,178 @@ bool CWindowCapture::makeTiledSnapshot(
     m_snapshots.erase(id);
     m_snapshots.emplace(id, std::move(snapshot));
 
+    refreshSkirtMaskTiled(id, m_snapshots.find(id)->second);
+
     return true;
+}
+
+// Depth-slab silhouette for windows: the snapshot texture's box region is
+// drawn into a small owned FBO (the GPU samples the snapshot's real alpha --
+// rounded corners included) and the outline is traced from that mask.
+// GL y grows with logical y on Hyprland textures, so readback row 0 is the
+// box's top row -- the convention the outline tracer works with.
+//
+// The cadence state and the traced outline live in m_skirtStates, keyed by
+// window id: the snapshot object is recreated on every content update, and
+// a state stored in it would reset the cadence to "now". Refresh policy:
+// first trace at full mask resolution; during a drag-resize (box changes
+// every frame) throttled to ~6.7/s at a reduced cap; the full-resolution
+// trace runs once the box settles -- stopped changing while the outline is
+// still stale.
+void CWindowCapture::refreshSkirtMask(std::uintptr_t id, SSnapshot& snapshot,
+                                      const PHLMONITOR& monitor) {
+    if (!monitor)
+        return;
+
+    auto& ST = m_skirtStates[id];
+
+    const int CBW = static_cast<int>(snapshot.sampledBox.w);
+    const int CBH = static_cast<int>(snapshot.sampledBox.h);
+
+    const bool STALE =
+        ST.valid && (ST.boxW != CBW || ST.boxH != CBH);
+    const bool SETTLED =
+        STALE && ST.lastBoxW == CBW && ST.lastBoxH == CBH;
+
+    ST.lastBoxW = CBW;
+    ST.lastBoxH = CBH;
+    ++ST.age;
+
+    const auto NOW = std::chrono::steady_clock::now();
+    const bool THROTTLE_OK =
+        !ST.hasTime || NOW - ST.lastRefresh > std::chrono::milliseconds(150);
+
+    const bool DUE = !ST.valid || STALE || ST.age % 64 == 1;
+
+    if (DUE && (SETTLED || THROTTLE_OK)) {
+        const GLuint SRC = snapshot.texID;
+
+        if (!SRC) {
+            snapshot.skirtError = 1;
+            return;
+        }
+
+        const double SX = monitor->m_pixelSize.x / monitor->m_size.x;
+        const double SY = monitor->m_pixelSize.y / monitor->m_size.y;
+
+        const int PW = std::max(1, static_cast<int>(std::lround(
+                                      snapshot.sampledBox.w * SX)));
+        const int PH = std::max(1, static_cast<int>(std::lround(
+                                      snapshot.sampledBox.h * SY)));
+
+        // UV subrect of the box inside the monitor-sized snapshot, clamped
+        // to the texture. v0 is the box's TOP row (top-down texture).
+        const float U0 = std::clamp(
+            static_cast<float>(snapshot.sampledBox.x * SX / snapshot.width),
+            0.f, 1.f);
+        const float V0 = std::clamp(
+            static_cast<float>(snapshot.sampledBox.y * SY / snapshot.height),
+            0.f, 1.f);
+        const float U1 = std::clamp(
+            static_cast<float>((snapshot.sampledBox.x + snapshot.sampledBox.w) *
+                               SX / snapshot.width),
+            0.f, 1.f);
+        const float V1 = std::clamp(
+            static_cast<float>((snapshot.sampledBox.y + snapshot.sampledBox.h) *
+                               SY / snapshot.height),
+            0.f, 1.f);
+
+        // The mask texel size IS the staircase step on the walls: full
+        // resolution when settled (or on the first trace), reduced mid-drag
+        // -- the silhouette is transient there anyway.
+        const float CAP = (!ST.valid || SETTLED) ? 1536.0f : 512.0f;
+
+        const float SCALE = std::min({1.0f, CAP / PW, CAP / PH});
+        const int MW = std::max(1, static_cast<int>(std::lround(PW * SCALE)));
+        const int MH = std::max(1, static_cast<int>(std::lround(PH * SCALE)));
+
+        // Wall sampling depth, in SOURCE pixels: half the border band, so
+        // the walls paint the middle of the border -- not the antialiased
+        // fringe, not the content behind it. surfaceOffset.x is exactly
+        // that band's width for server-side decorations; clamped for CSD
+        // windows whose offset is the shadow margin instead.
+        const float INSET_PX = std::clamp(
+            static_cast<float>(snapshot.surfaceOffset.x) * 0.5f, 1.0f, 3.0f);
+
+        std::vector<unsigned char> alpha;
+
+        const int ERR =
+            copyTextureAlpha(SRC, U0, V0, U1, V1, MW, MH, alpha);
+
+        if (ERR != 0) {
+            snapshot.skirtError = ERR;
+            return;
+        }
+
+        finishSkirtMask(ST, snapshot, std::move(alpha), MW, MH,
+                        INSET_PX * static_cast<float>(MW) / PW, CBW, CBH);
+
+        ST.lastRefresh = NOW;
+        ST.hasTime     = true;
+    } else {
+        // Gated out: keep sharing the surviving outline.
+        snapshot.outlines   = ST.outlines;
+        snapshot.skirtW     = ST.w;
+        snapshot.skirtH     = ST.h;
+        snapshot.skirtValid = ST.valid;
+        snapshot.skirtError = 0;
+    }
+}
+
+// Tiled composite: bigTex spans exactly the window box, so the copy subrect
+// is the full texture. Same throttle/settle policy as the monitor-sized
+// path (a tiled window resized below the monitor size re-routes through
+// makeSnapshot's non-tiled path, so stale tiled outlines self-heal).
+void CWindowCapture::refreshSkirtMaskTiled(std::uintptr_t id, SSnapshot& snapshot) {
+    auto& ST = m_skirtStates[id];
+    ++ST.age;
+
+    const auto NOW = std::chrono::steady_clock::now();
+    const bool THROTTLE_OK =
+        !ST.hasTime || NOW - ST.lastRefresh > std::chrono::milliseconds(150);
+
+    if (!ST.valid || ST.age % 64 == 1) {
+        const GLuint SRC = snapshot.bigTex;
+
+        if (!SRC || snapshot.width <= 0 || snapshot.height <= 0) {
+            snapshot.skirtError = 1;
+            return;
+        }
+
+        const float SCALE = std::min(
+            {1.0f, 1536.0f / snapshot.width, 1536.0f / snapshot.height});
+        const int MW =
+            std::max(1, static_cast<int>(std::lround(snapshot.width * SCALE)));
+        const int MH =
+            std::max(1, static_cast<int>(std::lround(snapshot.height * SCALE)));
+
+        const float INSET_PX = std::clamp(
+            static_cast<float>(snapshot.surfaceOffset.x) * 0.5f, 1.0f, 3.0f);
+
+        std::vector<unsigned char> alpha;
+
+        const int ERR =
+            copyTextureAlpha(SRC, 0.f, 0.f, 1.f, 1.f, MW, MH, alpha);
+
+        if (ERR != 0) {
+            snapshot.skirtError = ERR;
+            return;
+        }
+
+        finishSkirtMask(ST, snapshot, std::move(alpha), MW, MH,
+                        INSET_PX * static_cast<float>(MW) / snapshot.width,
+                        static_cast<int>(snapshot.texSpan.x),
+                        static_cast<int>(snapshot.texSpan.y));
+
+        ST.lastRefresh = NOW;
+        ST.hasTime     = true;
+    } else {
+        snapshot.outlines   = ST.outlines;
+        snapshot.skirtW     = ST.w;
+        snapshot.skirtH     = ST.h;
+        snapshot.skirtValid = ST.valid;
+        snapshot.skirtError = 0;
+    }
 }
 
 // Layer-shell surfaces render at their monitor-local box with no
@@ -434,6 +877,13 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
             snapshot.alphaW     = MW;
             snapshot.alphaH     = MH;
             snapshot.alphaValid = true;
+
+            // The same mask doubles as the depth-slab silhouette source:
+            // bars and panels get contour-hugging walls for free.
+            snapshot.outlines =
+                std::make_shared<const std::vector<H3D::SOutlineLoop>>(
+                    H3D::traceOutlines(snapshot.alphaMask.data(), MW, MH, 64,
+                                       1.5f, 4, 128));
         }
     }
 
@@ -471,6 +921,8 @@ void CWindowCapture::release(std::uintptr_t id) {
         destroySnapshotGL(IT->second);
         m_snapshots.erase(IT);
     }
+
+    m_skirtStates.erase(id);
 }
 
 void CWindowCapture::releaseAll() {
@@ -478,6 +930,7 @@ void CWindowCapture::releaseAll() {
         destroySnapshotGL(snapshot);
 
     m_snapshots.clear();
+    m_skirtStates.clear();
 }
 
 void CWindowCapture::retainOnly(const std::vector<std::uintptr_t>& keep) {
@@ -489,13 +942,18 @@ void CWindowCapture::retainOnly(const std::vector<std::uintptr_t>& keep) {
             ++IT;
         else {
             destroySnapshotGL(IT->second);
+            m_skirtStates.erase(IT->first);
             IT = m_snapshots.erase(IT);
         }
     }
 }
 
 void CWindowCapture::shutdownGL() {
+    if (Render::GL::g_pHyprOpenGL)
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+
     releaseAll();
+    shutdownCopyGL();
 }
 
 } // namespace H3D::Compat

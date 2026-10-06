@@ -8,6 +8,11 @@
 
 #include <GLES3/gl32.h>
 
+// The test stubs carry only a subset of the GL constants.
+#ifndef GL_STREAM_DRAW
+#define GL_STREAM_DRAW 0x88E0
+#endif
+
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
@@ -1279,10 +1284,15 @@ uint64_t GLScene::sceneFingerprint() const {
 // same rule as the panorama.
 void GLScene::refreshScene() {
     for (auto& S : m_slots) {
+        // A file read and decoded on the model's worker gets its GL objects
+        // here, with the context current.
+        if (S.model)
+            S.model->poll();
+
         const std::string& CFG_PATH = S.spec.path;
 
         if (CFG_PATH.empty()) {
-            if (S.model && S.model->loaded()) {
+            if (S.model && (S.model->loaded() || S.model->pending())) {
                 S.model->destroy();
                 S.loadedPath.clear();
                 S.mtimeValid = false;
@@ -1301,9 +1311,13 @@ void GLScene::refreshScene() {
         std::error_code ec;
         const auto MTIME = std::filesystem::last_write_time(path, ec);
 
-        const bool UNCHANGED = S.model && S.model->loaded() &&
-            S.loadedPath == path && S.mtimeValid && !ec &&
-            MTIME == S.mtime;
+        // The same file as last time, also when it is still missing. Loading,
+        // loaded or failed, it is not started again until it changes: a load
+        // per frame would start a worker per frame.
+        const bool SAME_FILE = S.loadedPath == path &&
+            S.mtimeValid == !ec && (ec || MTIME == S.mtime);
+        const bool UNCHANGED = S.model && SAME_FILE &&
+            (S.model->loaded() || S.model->pending() || S.model->failed());
 
         if (UNCHANGED)
             continue;
@@ -1317,15 +1331,154 @@ void GLScene::refreshScene() {
     }
 }
 
+// The player's collision capsule outline (F3): three circles + four
+// verticals, rebuilt every drawn frame (a couple hundred floats).
+void GLScene::drawPlayerDebugCapsule(const Mat4& vp) {
+    if (!m_pDbgProgram) {
+        static const char* VS = R"GLSL(
+#version 320 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
+)GLSL";
+        static const char* FS = R"GLSL(
+#version 320 es
+precision mediump float;
+out vec4 fragColor;
+void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
+)GLSL";
+        const GLuint VSx = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(VSx, 1, &VS, nullptr);
+        glCompileShader(VSx);
+        const GLuint FSx = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(FSx, 1, &FS, nullptr);
+        glCompileShader(FSx);
+        const GLuint P = glCreateProgram();
+        glAttachShader(P, VSx);
+        glAttachShader(P, FSx);
+        glLinkProgram(P);
+        glDeleteShader(VSx);
+        glDeleteShader(FSx);
+        m_pDbgProgram = P;
+        m_pDbgMVP     = glGetUniformLocation(P, "uMVP");
+    }
+
+    const float R = 0.3f;             // Camera::kBodyHalfWidth
+    const float CY = m_pDbgCenter.y;  // the Jolt body center (feet + 0.9)
+    const float HH = 0.6f;            // the cylinder half height (0.9 - r)
+    const int SEG = 24;
+
+    std::vector<float> V;
+    V.reserve(3 * (3 * SEG * 2 + 8));
+    const auto CIRCLE = [&](float y) {
+        for (int s = 0; s < SEG; ++s) {
+            const float A0 = float(s) / SEG * 6.2831853f;
+            const float A1 = float(s + 1) / SEG * 6.2831853f;
+            V.push_back(m_pDbgCenter.x + std::cos(A0) * R);
+            V.push_back(CY + y);
+            V.push_back(m_pDbgCenter.z + std::sin(A0) * R);
+            V.push_back(m_pDbgCenter.x + std::cos(A1) * R);
+            V.push_back(CY + y);
+            V.push_back(m_pDbgCenter.z + std::sin(A1) * R);
+        }
+    };
+    CIRCLE(-HH);
+    CIRCLE(0.f);
+    CIRCLE(HH);
+    for (int s = 0; s < 4; ++s) {
+        const float A = float(s) / 4 * 6.2831853f + 0.3926991f;
+        const float X = m_pDbgCenter.x + std::cos(A) * R;
+        const float Z = m_pDbgCenter.z + std::sin(A) * R;
+        V.push_back(X); V.push_back(CY - HH); V.push_back(Z);
+        V.push_back(X); V.push_back(CY + HH); V.push_back(Z);
+    }
+    m_pDbgVerts = static_cast<int>(V.size() / 3);
+
+    if (!m_pDbgVAO) {
+        glGenVertexArrays(1, &m_pDbgVAO);
+        glGenBuffers(1, &m_pDbgVBO);
+        glBindVertexArray(m_pDbgVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_pDbgVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glBindVertexArray(0);
+    }
+
+    glUseProgram(m_pDbgProgram);
+    glUniformMatrix4fv(m_pDbgMVP, 1, GL_FALSE, vp.m.data());
+    glBindVertexArray(m_pDbgVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pDbgVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(V.size() * sizeof(float)),
+                 V.data(), GL_STREAM_DRAW);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDrawArrays(GL_LINES, 0, m_pDbgVerts);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// Loads (or reloads) the player character when the config path or the
+// file's mtime changed; applies the per-state animation assignment after a
+// successful load. Runs inside render() so the EGL context is current.
+void GLScene::refreshPlayer() {
+    const std::string& CFG_PATH = m_playerCfg.path;
+
+    if (CFG_PATH.empty()) {
+        if (m_player.loaded())
+            m_player.destroy();
+        m_playerPath.clear();
+        return;
+    }
+
+    std::string path = CFG_PATH;
+    if (path.starts_with('~')) {
+        if (const char* HOME = getenv("HOME"))
+            path = std::string{HOME} + path.substr(1);
+    }
+
+    std::error_code ec;
+    const auto MTIME = std::filesystem::last_write_time(path, ec);
+
+    const bool UNCHANGED = m_player.loaded() && m_playerPath == path &&
+        !ec && m_playerMtimeValid && MTIME == m_playerMtime;
+    if (UNCHANGED)
+        return;
+
+    m_playerPath       = path;
+    m_playerMtime      = MTIME;
+    m_playerMtimeValid = !ec;
+
+    if (ec) {
+        if (m_player.loaded())
+            m_player.destroy();
+        return;
+    }
+
+    if (m_player.load(path)) {
+        for (int s = 0; s < CPlayerModel::kStateCount; ++s) {
+            const auto ST = static_cast<CPlayerModel::EState>(s);
+            if (!m_playerCfg.animName[s].empty())
+                m_player.setAnim(ST, m_playerCfg.animName[s]);
+            else
+                m_player.setAnim(ST, m_playerCfg.animIdx[s]);
+            m_player.setAnimSpeed(ST, m_playerCfg.animSpeed[s]);
+        }
+    }
+}
+
 void GLScene::drawPanorama(float aspect) {
     if (!m_panoramaTex || !m_panoramaProgram)
         return;
 
     glUseProgram(m_panoramaProgram);
 
-    const Vec3 FWD   = m_camera.forward();
-    const Vec3 RIGHT = m_camera.right();
-    const Vec3 UP    = cross(RIGHT, FWD);
+    Vec3 FWD   = m_camera.forward();
+    Vec3 RIGHT = m_camera.right();
+    Vec3 UP    = cross(RIGHT, FWD);
     // Zoomed fov (C key): the panorama must narrow with the scene, so its
     // half-tangent divides by the magnification exactly like the render
     // projection's fov does.
@@ -1337,8 +1490,16 @@ void GLScene::drawPanorama(float aspect) {
     // stays level while the scene rolls. Matches Camera::view(): screen up
     // = UP*cos(r) + RIGHT*sin(r), screen right = RIGHT*cos(r) - UP*sin(r).
     const float RROLL = m_camera.roll;
-    const Vec3 RRIGHT = RIGHT * std::cos(RROLL) - UP * std::sin(RROLL);
-    const Vec3 RUP    = UP * std::cos(RROLL) + RIGHT * std::sin(RROLL);
+    Vec3 RRIGHT = RIGHT * std::cos(RROLL) - UP * std::sin(RROLL);
+    Vec3 RUP    = UP * std::cos(RROLL) + RIGHT * std::sin(RROLL);
+
+    // The front third-person view looks BACK along the look axis: the view
+    // matrix and the world flip with it, and the panorama's pixel->ray
+    // basis must flip too (direction and screen right; the up stays).
+    if (m_camera.mirrorView) {
+        FWD   = FWD * -1.0f;
+        RRIGHT = RRIGHT * -1.0f;
+    }
 
     // Analytic mip level: texels per screen pixel at the view centre. The
     // panorama is W texels around 2*pi radians; one screen pixel spans about
@@ -1409,8 +1570,21 @@ void GLScene::drawWindows(
 ) {
     // World-space polygons for the visible windows (the unit quad's corners
     // run through each window's model matrix; uvRect is folded into the
-    // corner UVs).
-    std::vector<SWPoly> polys;
+    // corner UVs). A depth slab adds the back face and one wall quad per
+    // silhouette segment; the slab's interior is kept SEPARATE from the
+    // content face and assembled after all faces -- see the invariant at
+    // the assembly below.
+    struct SWinSlab {
+        SWPoly              front{}; // the content face
+        SWPoly              back{};  // the mirrored content face
+        std::vector<SWPoly> inner;   // the walls
+        float               dist = 0.f;
+        bool                fromBehind = false; // eye on the back side
+    };
+    std::vector<SWinSlab> slabs;
+    slabs.reserve(windows.size());
+
+    const Vec3 eye = m_camera.position;
 
     for (const auto& window : windows) {
         if (!window.texture)
@@ -1429,57 +1603,171 @@ void GLScene::drawWindows(
             Mat4::rotationZ(window.roll) *
             Mat4::scale({window.width, window.height, 1.0f});
 
+        // Local quad point -> world, through the model matrix columns (the
+        // scale in m[12..] means this is NOT a plain matrix*vec).
+        const auto WORLD = [&model](float lx, float ly, float lz) {
+            return Vec3{
+                model.m[0] * lx + model.m[4] * ly + model.m[8] * lz + model.m[12],
+                model.m[1] * lx + model.m[5] * ly + model.m[9] * lz + model.m[13],
+                model.m[2] * lx + model.m[6] * ly + model.m[10] * lz + model.m[14],
+            };
+        };
+
         const float CU[4] = {0.f, 1.f, 1.f, 0.f};
         const float CV[4] = {0.f, 0.f, 1.f, 1.f};
         const float LX[4] = {-0.5f, 0.5f, 0.5f, -0.5f};
         const float LY[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
 
-        SWPoly poly;
-        poly.tex   = window.texture;
-        poly.alpha = window.alpha;
+        SWinSlab slab;
+        slab.front.tex   = window.texture;
+        slab.front.alpha = window.alpha;
 
         for (int c = 0; c < 4; ++c) {
-            const Vec3 LOCAL{LX[c], LY[c], 0.f};
             SWVert V{
-                Vec3{
-                    model.m[0] * LOCAL.x + model.m[4] * LOCAL.y +
-                        model.m[8] * LOCAL.z + model.m[12],
-                    model.m[1] * LOCAL.x + model.m[5] * LOCAL.y +
-                        model.m[9] * LOCAL.z + model.m[13],
-                    model.m[2] * LOCAL.x + model.m[6] * LOCAL.y +
-                        model.m[10] * LOCAL.z + model.m[14],
-                },
+                WORLD(LX[c], LY[c], 0.f),
                 window.u0 + (window.u1 - window.u0) * CU[c],
                 window.v0 + (window.v1 - window.v0) * CV[c],
             };
-            poly.verts.push_back(V);
+            slab.front.verts.push_back(V);
         }
 
-        polys.push_back(std::move(poly));
+        // Which side of the window the eye is on: the slab's painter order
+        // flips with it (see the assembly below).
+        const Vec3 NORMAL =
+            normalize(Vec3{model.m[8], model.m[9], model.m[10]});
+        slab.fromBehind =
+            dot(eye - Vec3{window.x, window.y, window.z}, NORMAL) < 0.0f;
+
+        // --- depth slab -----------------------------------------------------
+        // Extruded backwards along the window's normal: the front face keeps
+        // its exact plane, so picking, input mapping and collision geometry
+        // are untouched. Walls hug the captured alpha silhouette (when one
+        // was traced), so rounded corners keep their shape, and every wall
+        // samples its silhouette texel -- the window texture's edge colors
+        // paint the whole side.
+        if (window.depth > 0.0f) {
+            const float DEPTH = window.depth;
+
+            // Back face: the mirrored content quad at the rear plane. It
+            // renders ONLY for an eye on the back side (see the assembly):
+            // each content face is visible exclusively from its own side,
+            // so the two never stack through a translucent window.
+            slab.back.tex   = window.texture;
+            slab.back.alpha = window.alpha;
+
+            for (int c = 0; c < 4; ++c) {
+                SWVert V{
+                    WORLD(LX[c], LY[c], 0.f) - NORMAL * DEPTH,
+                    window.u0 + (window.u1 - window.u0) * CU[c],
+                    window.v0 + (window.v1 - window.v0) * CV[c],
+                };
+                slab.back.verts.push_back(V);
+            }
+
+            const auto SUBRECT_UV = [&window](const Vec2& P) {
+                return Vec2{
+                    window.u0 + (window.u1 - window.u0) * P.x,
+                    // Outline y is top-down (row 0 = the box's top), and v1
+                    // is the subrect's top edge: v runs from v1 (y=0) to
+                    // v0 (y=1).
+                    window.v1 + (window.v0 - window.v1) * P.y,
+                };
+            };
+
+            // Wall loops: the traced silhouette when available, else the
+            // plain box outline (first frames before a mask was read back).
+            //
+            // Every segment is emitted TWICE-SIDED -- no facing test: a
+            // translucent window must show its FAR walls through the front
+            // face (they blend in BSP order, far first), and for opaque
+            // windows the hidden walls are simply depth-rejected by the
+            // front face drawn after them.
+            const auto EMIT_WALLS = [&](const std::vector<Vec2>& pts,
+                                        const std::vector<Vec2>& uvs) {
+                const size_t N = pts.size();
+                if (N < 3)
+                    return;
+
+                for (size_t i = 0; i < N; ++i) {
+                    const Vec2& A  = pts[i];
+                    const Vec2& B  = pts[(i + 1) % N];
+                    const Vec2& UA = uvs[i];
+                    const Vec2& UB = uvs[(i + 1) % N];
+
+                    const Vec3 AF = WORLD(A.x - 0.5f, 0.5f - A.y, 0.f);
+                    const Vec3 BF = WORLD(B.x - 0.5f, 0.5f - B.y, 0.f);
+
+                    const Vec2 SUA = SUBRECT_UV(UA);
+                    const Vec2 SUB = SUBRECT_UV(UB);
+
+                    SWPoly wall;
+                    wall.tex   = window.texture;
+                    wall.alpha = window.alpha;
+
+                    wall.verts.push_back(SWVert{AF, SUA.x, SUA.y});
+                    wall.verts.push_back(SWVert{BF, SUB.x, SUB.y});
+                    wall.verts.push_back(
+                        SWVert{BF - NORMAL * DEPTH, SUB.x, SUB.y});
+                    wall.verts.push_back(
+                        SWVert{AF - NORMAL * DEPTH, SUA.x, SUA.y});
+
+                    slab.inner.push_back(std::move(wall));
+                }
+            };
+
+            if (window.outlines && !window.outlines->empty()) {
+                for (const auto& LOOP : *window.outlines)
+                    EMIT_WALLS(LOOP.pts, LOOP.uvs);
+            } else {
+                // No silhouette traced (yet) -- the mask readback may fail
+                // legitimately. The slab must never lose its sides: fall
+                // back to the plain box outline.
+                static const std::vector<Vec2> RECT = {
+                    {0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f}, {0.f, 1.f}};
+                EMIT_WALLS(RECT, RECT);
+            }
+        }
+
+        const float DX = slab.front.verts[0].p.x - eye.x;
+        const float DY = slab.front.verts[0].p.y - eye.y;
+        const float DZ = slab.front.verts[0].p.z - eye.z;
+        slab.dist = DX * DX + DY * DY + DZ * DZ;
+
+        slabs.push_back(std::move(slab));
+    }
+
+    // Painter-order assembly, windows far-to-near (coplanar overlapping
+    // faces blend far first). Within a window the surfaces are ordered
+    // far-to-near FOR THE EYE'S SIDE OF THE SLAB -- walls then face from
+    // the front; face then walls from behind. This order survives the BSP
+    // unchanged for all non-crossing polys (the builder files every
+    // behind-or-on-plane poly into the node's coplanar list in insertion
+    // order), so whichever surface is farthest blends FIRST and a
+    // translucent slab shows its far walls through the near face from BOTH
+    // sides -- no ordering luck. Genuinely crossing polys are still split
+    // by the node planes as before.
+    std::sort(
+        slabs.begin(),
+        slabs.end(),
+        [](const SWinSlab& a, const SWinSlab& b) { return a.dist > b.dist; });
+
+    std::vector<SWPoly> polys;
+    polys.reserve(slabs.size() * 8);
+
+    for (auto& S : slabs) {
+        // Walls first, then the content face the eye is actually on: the
+        // other content face is not emitted at all, so the two never stack
+        // through a translucent window -- from the front you see the front
+        // face (plus the far walls through it), from behind the back face
+        // (plus the far walls through it).
+        for (auto& P : S.inner)
+            polys.push_back(std::move(P));
+
+        polys.push_back(std::move(S.fromBehind ? S.back : S.front));
     }
 
     if (polys.empty())
         return;
-
-    // Far-to-near insertion order: coplanar overlapping windows (which the
-    // BSP keeps in insertion order) then blend far first, like the sort the
-    // old painter path used.
-    const Vec3 eye = m_camera.position;
-
-    std::sort(
-        polys.begin(),
-        polys.end(),
-        [&eye](const SWPoly& a, const SWPoly& b) {
-            const float ax = a.verts[0].p.x - eye.x;
-            const float ay = a.verts[0].p.y - eye.y;
-            const float az = a.verts[0].p.z - eye.z;
-            const float bx = b.verts[0].p.x - eye.x;
-            const float by = b.verts[0].p.y - eye.y;
-            const float bz = b.verts[0].p.z - eye.z;
-            return ax * ax + ay * ay + az * az >
-                   bx * bx + by * by + bz * bz;
-        }
-    );
 
     // Exact ordering: split crossing quads along each other's planes and
     // traverse back-to-front from the eye.
@@ -1528,20 +1816,35 @@ void GLScene::drawWindows(
 
     glActiveTexture(GL_TEXTURE0);
 
-    for (const auto& P : ordered) {
-        std::vector<float> verts;
-        verts.reserve(P.verts.size() * 5);
+    // Consecutive polys with the same texture and alpha merge into ONE
+    // upload + draw: a depth slab adds ~100 wall quads per window, and a
+    // draw call per wall quad would sink the frame. Only CONSECUTIVE polys
+    // group, so the BSP's back-to-front blend order is untouched -- batches
+    // interleave exactly where windows overlap.
+    std::vector<float> verts;
 
-        for (size_t i = 1; i + 1 < P.verts.size(); ++i) {
-            const auto& A = P.verts[0];
-            const auto& B = P.verts[i];
-            const auto& C = P.verts[i + 1];
+    for (size_t i = 0; i < ordered.size();) {
+        size_t j = i;
+        while (j < ordered.size() && ordered[j].tex == ordered[i].tex &&
+               ordered[j].alpha == ordered[i].alpha)
+            ++j;
 
-            verts.insert(verts.end(), {
-                A.p.x, A.p.y, A.p.z, A.u, A.v,
-                B.p.x, B.p.y, B.p.z, B.u, B.v,
-                C.p.x, C.p.y, C.p.z, C.u, C.v,
-            });
+        verts.clear();
+
+        for (size_t k = i; k < j; ++k) {
+            const auto& P = ordered[k];
+
+            for (size_t v = 1; v + 1 < P.verts.size(); ++v) {
+                const auto& A = P.verts[0];
+                const auto& B = P.verts[v];
+                const auto& C = P.verts[v + 1];
+
+                verts.insert(verts.end(), {
+                    A.p.x, A.p.y, A.p.z, A.u, A.v,
+                    B.p.x, B.p.y, B.p.z, B.u, B.v,
+                    C.p.x, C.p.y, C.p.z, C.u, C.v,
+                });
+            }
         }
 
         glBufferData(GL_ARRAY_BUFFER,
@@ -1554,12 +1857,14 @@ void GLScene::drawWindows(
                               reinterpret_cast<void*>(3 * sizeof(float)));
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, P.tex);
+        glBindTexture(GL_TEXTURE_2D, ordered[i].tex);
         glUniform1i(m_sceneTextured, 1);
-        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, P.alpha);
+        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, ordered[i].alpha);
 
         glDrawArrays(GL_TRIANGLES, 0,
                      static_cast<GLint>(verts.size() / 5));
+
+        i = j;
     }
 
     glBindVertexArray(0);
@@ -2103,6 +2408,21 @@ bool GLScene::render(
 
         // Red x-ray wireframe of the collision triangles (debug).
         S.model->drawDebug(vp);
+    }
+
+    // The player's character (hidden in first person): animated inside
+    // render -- the clock and the vertex upload need the EGL context.
+    refreshPlayer();
+    if (m_pDbgOn)
+        drawPlayerDebugCapsule(vp);
+    if (m_playerVisible && m_player.loaded()) {
+        m_player.setPose(m_playerFeet, m_playerYaw, m_playerCfg.scale,
+                         m_playerCfg.posOffset + m_playerCfg.centerOffset,
+                         m_playerCfg.rotDeg);
+        m_player.setFlat(m_playerCfg.flat);
+        m_player.setEmissiveScale(m_playerCfg.emissiveScale);
+        m_player.update(dt);
+        m_player.draw(vp, m_camera.position);
     }
 
     if (m_gridVisible) {
