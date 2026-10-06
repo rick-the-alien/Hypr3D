@@ -118,6 +118,11 @@ class CWindowCapture {
     // the layer's monitor-local box, no decorations, no off-screen pull.
     bool makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& monitor, bool force = false);
 
+    // A window's popup (menu, tooltip), captured at its own box; `box` is
+    // its monitor-local box.
+    bool makeSnapshotPopup(const WP<Desktop::View::CPopup>& popup, const CBox& box,
+                           const PHLMONITOR& monitor, bool force = false);
+
   private:
     // Oversized windows: monitor-sized tiles, composited into one texture.
     bool makeTiledSnapshot(
