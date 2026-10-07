@@ -20,6 +20,12 @@ fi
 
 mkdir -p "$DIR"
 
+# After a crash/restart an inherited HYPRLAND_INSTANCE_SIGNATURE points at a
+# dead instance: use the one whose socket is our WAYLAND_DISPLAY.
+LIVE=$(hyprctl instances -j 2>/dev/null | jq -r --arg w "${WAYLAND_DISPLAY:-}" \
+    '.[] | select(.wl_socket==$w) | .instance' | head -1)
+[ -n "$LIVE" ] && export HYPRLAND_INSTANCE_SIGNATURE="$LIVE"
+
 unload() {
     local OUT
     OUT=$(hyprctl plugin unload "$1" 2>&1)
